@@ -21,6 +21,7 @@ use super::{
 };
 use super::{endpoint::Endpoint, error::DiskError, format::FormatV3};
 
+use crate::data_usage::local_snapshot::ensure_data_usage_layout;
 use crate::disk::error::FileAccessDeniedWithContext;
 use crate::disk::error_conv::{to_access_error, to_file_error, to_unformatted_disk_error, to_volume_error};
 use crate::disk::fs::{
@@ -147,8 +148,10 @@ impl LocalDisk {
             }
         };
 
+        ensure_data_usage_layout(&root).await.map_err(DiskError::from)?;
+
         if cleanup {
-            // TODO: 删除 tmp 数据
+            // TODO: remove temporary data
         }
 
         // Use optimized path resolution instead of absolutize_virtually
@@ -2346,12 +2349,7 @@ impl DiskAPI for LocalDisk {
         self.delete_file(&volume_dir, &xl_path, true, false).await
     }
     #[tracing::instrument(level = "debug", skip(self))]
-    async fn delete_versions(
-        &self,
-        volume: &str,
-        versions: Vec<FileInfoVersions>,
-        _opts: DeleteOptions,
-    ) -> Result<Vec<Option<Error>>> {
+    async fn delete_versions(&self, volume: &str, versions: Vec<FileInfoVersions>, _opts: DeleteOptions) -> Vec<Option<Error>> {
         let mut errs = Vec::with_capacity(versions.len());
         for _ in 0..versions.len() {
             errs.push(None);
@@ -2365,7 +2363,7 @@ impl DiskAPI for LocalDisk {
             }
         }
 
-        Ok(errs)
+        errs
     }
 
     #[tracing::instrument(skip(self))]

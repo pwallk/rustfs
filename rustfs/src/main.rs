@@ -25,30 +25,27 @@ mod storage;
 mod update;
 mod version;
 
-// Ensure the correct path for parse_license is imported
 use crate::admin::console::init_console_cfg;
 use crate::server::{
-    SHUTDOWN_TIMEOUT, ServiceState, ServiceStateManager, ShutdownSignal, start_console_server, start_http_server,
-    wait_for_shutdown,
+    SHUTDOWN_TIMEOUT, ServiceState, ServiceStateManager, ShutdownSignal, init_event_notifier, shutdown_event_notifier,
+    start_audit_system, start_console_server, start_http_server, stop_audit_system, wait_for_shutdown,
 };
 use crate::storage::ecfs::{process_lambda_configurations, process_queue_configurations, process_topic_configurations};
 use chrono::Datelike;
 use clap::Parser;
 use license::init_license;
-use rustfs_ahm::scanner::data_scanner::ScannerConfig;
 use rustfs_ahm::{
-    Scanner, create_ahm_services_cancel_token, heal::storage::ECStoreHealStorage, init_heal_manager, shutdown_ahm_services,
+    Scanner, create_ahm_services_cancel_token, heal::storage::ECStoreHealStorage, init_heal_manager,
+    scanner::data_scanner::ScannerConfig, shutdown_ahm_services,
 };
 use rustfs_common::globals::set_global_addr;
-use rustfs_config::DEFAULT_DELIMITER;
 use rustfs_config::DEFAULT_UPDATE_CHECK;
 use rustfs_config::ENV_UPDATE_CHECK;
 use rustfs_ecstore::bucket::metadata_sys;
 use rustfs_ecstore::bucket::metadata_sys::init_bucket_metadata_sys;
-use rustfs_ecstore::cmd::bucket_replication::init_bucket_replication_pool;
+use rustfs_ecstore::bucket::replication::{GLOBAL_REPLICATION_POOL, init_background_replication};
 use rustfs_ecstore::config as ecconfig;
 use rustfs_ecstore::config::GLOBAL_CONFIG_SYS;
-use rustfs_ecstore::config::GLOBAL_SERVER_CONFIG;
 use rustfs_ecstore::store_api::BucketOptions;
 use rustfs_ecstore::{
     StorageAPI,
@@ -65,11 +62,11 @@ use rustfs_notify::global::notifier_instance;
 use rustfs_obs::{init_obs, set_global_guard};
 use rustfs_targets::arn::TargetID;
 use rustfs_utils::net::parse_and_resolve_address;
-// KMS is now managed dynamically via API
 use s3s::s3_error;
 use std::io::{Error, Result};
 use std::str::FromStr;
 use std::sync::Arc;
+use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, instrument, warn};
 
 #[cfg(all(target_os = "linux", target_env = "gnu"))]
@@ -100,8 +97,29 @@ fn print_server_info() {
     info!("Docs: https://rustfs.com/docs/");
 }
 
-#[tokio::main]
-async fn main() -> Result<()> {
+fn main() -> Result<()> {
+    let mut builder = server::get_tokio_runtime_builder();
+    builder.enable_all();
+    if server::print_tokio_thread_enable() {
+        builder.on_thread_start(|| {
+            println!(
+                "RustFS Worker Thread running - initializing resources time: {:?}, thread id: {:?}",
+                chrono::Utc::now().to_rfc3339(),
+                std::thread::current().id()
+            );
+        });
+        builder.on_thread_stop(|| {
+            println!(
+                "RustFS Worker Thread stopping - cleaning up resources time: {:?}, thread id: {:?}",
+                chrono::Utc::now().to_rfc3339(),
+                std::thread::current().id()
+            )
+        });
+    }
+    let runtime = builder.build().expect("Failed to build Tokio runtime");
+    runtime.block_on(async_main())
+}
+async fn async_main() -> Result<()> {
     // Parse the obtained parameters
     let opt = config::Opt::parse();
 
@@ -260,20 +278,31 @@ async fn run(opt: config::Opt) -> Result<()> {
     // Initialize the local disk
     init_local_disks(endpoint_pools.clone()).await.map_err(Error::other)?;
 
+    let ctx = CancellationToken::new();
+
     // init store
-    let store = ECStore::new(server_addr, endpoint_pools.clone()).await.inspect_err(|err| {
-        error!("ECStore::new {:?}", err);
-    })?;
+    let store = ECStore::new(server_addr, endpoint_pools.clone(), ctx.clone())
+        .await
+        .inspect_err(|err| {
+            error!("ECStore::new {:?}", err);
+        })?;
 
     ecconfig::init();
     // config system configuration
     GLOBAL_CONFIG_SYS.init(store.clone()).await?;
 
+    // init  replication_pool
+    init_background_replication(store.clone()).await;
     // Initialize KMS system if enabled
     init_kms_system(&opt).await?;
 
     // Initialize event notifier
     init_event_notifier().await;
+    // Start the audit system
+    match start_audit_system().await {
+        Ok(_) => info!(target: "rustfs::main::run","Audit system started successfully."),
+        Err(e) => error!(target: "rustfs::main::run","Failed to start audit system: {}", e),
+    }
 
     let buckets_list = store
         .list_bucket(&BucketOptions {
@@ -285,6 +314,10 @@ async fn run(opt: config::Opt) -> Result<()> {
 
     // Collect bucket names into a vector
     let buckets: Vec<String> = buckets_list.into_iter().map(|v| v.name).collect();
+
+    if let Some(pool) = GLOBAL_REPLICATION_POOL.get() {
+        pool.clone().init_resync(ctx.clone(), buckets.clone()).await?;
+    }
 
     init_bucket_metadata_sys(store.clone(), buckets.clone()).await;
 
@@ -337,8 +370,6 @@ async fn run(opt: config::Opt) -> Result<()> {
 
     // print server info
     print_server_info();
-    // initialize bucket replication pool
-    init_bucket_replication_pool().await;
 
     init_update_check();
 
@@ -348,11 +379,11 @@ async fn run(opt: config::Opt) -> Result<()> {
     match wait_for_shutdown().await {
         #[cfg(unix)]
         ShutdownSignal::CtrlC | ShutdownSignal::Sigint | ShutdownSignal::Sigterm => {
-            handle_shutdown(&state_manager, &shutdown_tx).await;
+            handle_shutdown(&state_manager, &shutdown_tx, ctx.clone()).await;
         }
         #[cfg(not(unix))]
         ShutdownSignal::CtrlC => {
-            handle_shutdown(&state_manager, &shutdown_tx).await;
+            handle_shutdown(&state_manager, &shutdown_tx, ctx.clone()).await;
         }
     }
 
@@ -372,7 +403,13 @@ fn parse_bool_env_var(var_name: &str, default: bool) -> bool {
 }
 
 /// Handles the shutdown process of the server
-async fn handle_shutdown(state_manager: &ServiceStateManager, shutdown_tx: &tokio::sync::broadcast::Sender<()>) {
+async fn handle_shutdown(
+    state_manager: &ServiceStateManager,
+    shutdown_tx: &tokio::sync::broadcast::Sender<()>,
+    ctx: CancellationToken,
+) {
+    ctx.cancel();
+
     info!(
         target: "rustfs::main::handle_shutdown",
         "Shutdown signal received in main thread"
@@ -405,7 +442,21 @@ async fn handle_shutdown(state_manager: &ServiceStateManager, shutdown_tx: &toki
     }
 
     // Stop the notification system
+    info!(
+        target: "rustfs::main::handle_shutdown",
+        "Shutting down event notifier system..."
+    );
     shutdown_event_notifier().await;
+
+    // Stop the audit system
+    info!(
+        target: "rustfs::main::handle_shutdown",
+        "Stopping audit system..."
+    );
+    match stop_audit_system().await {
+        Ok(_) => info!("Audit system stopped successfully."),
+        Err(e) => error!("Failed to stop audit system: {}", e),
+    }
 
     info!(
         target: "rustfs::main::handle_shutdown",
@@ -422,58 +473,7 @@ async fn handle_shutdown(state_manager: &ServiceStateManager, shutdown_tx: &toki
         target: "rustfs::main::handle_shutdown",
         "Server stopped current "
     );
-}
-
-#[instrument]
-async fn init_event_notifier() {
-    info!(
-        target: "rustfs::main::init_event_notifier",
-        "Initializing event notifier..."
-    );
-
-    // 1. Get the global configuration loaded by ecstore
-    let server_config = match GLOBAL_SERVER_CONFIG.get() {
-        Some(config) => config.clone(), // Clone the config to pass ownership
-        None => {
-            error!("Event notifier initialization failed: Global server config not loaded.");
-            return;
-        }
-    };
-
-    info!(
-        target: "rustfs::main::init_event_notifier",
-        "Global server configuration loaded successfully"
-    );
-    // 2. Check if the notify subsystem exists in the configuration, and skip initialization if it doesn't
-    if server_config
-        .get_value(rustfs_config::notify::NOTIFY_MQTT_SUB_SYS, DEFAULT_DELIMITER)
-        .is_none()
-        || server_config
-            .get_value(rustfs_config::notify::NOTIFY_WEBHOOK_SUB_SYS, DEFAULT_DELIMITER)
-            .is_none()
-    {
-        info!(
-            target: "rustfs::main::init_event_notifier",
-            "'notify' subsystem not configured, skipping event notifier initialization."
-        );
-        return;
-    }
-
-    info!(
-        target: "rustfs::main::init_event_notifier",
-        "Event notifier configuration found, proceeding with initialization."
-    );
-
-    // 3. Initialize the notification system asynchronously with a global configuration
-    // Use direct await for better error handling and faster initialization
-    if let Err(e) = rustfs_notify::initialize(server_config).await {
-        error!("Failed to initialize event notifier system: {}", e);
-    } else {
-        info!(
-            target: "rustfs::main::init_event_notifier",
-            "Event notifier system initialized successfully."
-        );
-    }
+    println!("Server stopped successfully.");
 }
 
 fn init_update_check() {
@@ -569,28 +569,6 @@ async fn add_bucket_notification_configuration(buckets: Vec<String>) {
     }
 }
 
-/// Shuts down the event notifier system gracefully
-async fn shutdown_event_notifier() {
-    info!("Shutting down event notifier system...");
-
-    if !rustfs_notify::is_notification_system_initialized() {
-        info!("Event notifier system is not initialized, nothing to shut down.");
-        return;
-    }
-
-    let system = match rustfs_notify::notification_system() {
-        Some(sys) => sys,
-        None => {
-            error!("Event notifier system is not initialized.");
-            return;
-        }
-    };
-
-    // Call the shutdown function from the rustfs_notify module
-    system.shutdown().await;
-    info!("Event notifier system shut down successfully.");
-}
-
 /// Initialize KMS system and configure if enabled
 #[instrument(skip(opt))]
 async fn init_kms_system(opt: &config::Opt) -> Result<()> {
@@ -668,13 +646,13 @@ async fn init_kms_system(opt: &config::Opt) -> Result<()> {
         service_manager
             .configure(kms_config)
             .await
-            .map_err(|e| Error::other(format!("Failed to configure KMS: {}", e)))?;
+            .map_err(|e| Error::other(format!("Failed to configure KMS: {e}")))?;
 
         // Start the KMS service
         service_manager
             .start()
             .await
-            .map_err(|e| Error::other(format!("Failed to start KMS: {}", e)))?;
+            .map_err(|e| Error::other(format!("Failed to start KMS: {e}")))?;
 
         info!("KMS service configured and started successfully");
     } else {
