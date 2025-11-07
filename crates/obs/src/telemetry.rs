@@ -36,7 +36,7 @@ use opentelemetry_semantic_conventions::{
     attribute::{DEPLOYMENT_ENVIRONMENT_NAME, NETWORK_LOCAL_ADDRESS, SERVICE_VERSION as OTEL_SERVICE_VERSION},
 };
 use rustfs_config::{
-    APP_NAME, DEFAULT_LOG_KEEP_FILES, DEFAULT_LOG_LEVEL, DEFAULT_LOG_LOCAL_LOGGING_ENABLED, ENVIRONMENT, METER_INTERVAL,
+    APP_NAME, DEFAULT_LOG_KEEP_FILES, DEFAULT_LOG_LEVEL, DEFAULT_OBS_LOG_STDOUT_ENABLED, ENVIRONMENT, METER_INTERVAL,
     SAMPLE_RATIO, SERVICE_VERSION, USE_STDOUT,
     observability::{
         DEFAULT_OBS_ENVIRONMENT_PRODUCTION, DEFAULT_OBS_LOG_FLUSH_MS, DEFAULT_OBS_LOG_MESSAGE_CAPA, DEFAULT_OBS_LOG_POOL_CAPA,
@@ -50,6 +50,7 @@ use std::io::IsTerminal;
 use std::time::Duration;
 use std::{env, fs};
 use tracing::info;
+use tracing_appender::rolling::{RollingFileAppender, Rotation};
 use tracing_error::ErrorLayer;
 use tracing_opentelemetry::{MetricsLayer, OpenTelemetryLayer};
 use tracing_subscriber::fmt::format::FmtSpan;
@@ -74,6 +75,8 @@ pub struct OtelGuard {
     logger_provider: Option<SdkLoggerProvider>,
     // Add a flexi_logger handle to keep the logging alive
     _flexi_logger_handles: Option<flexi_logger::LoggerHandle>,
+    // WorkerGuard for writing tracing files
+    _tracing_guard: Option<tracing_appender::non_blocking::WorkerGuard>,
 }
 
 // Implement debug manually and avoid relying on all fields to implement debug
@@ -84,6 +87,7 @@ impl std::fmt::Debug for OtelGuard {
             .field("meter_provider", &self.meter_provider.is_some())
             .field("logger_provider", &self.logger_provider.is_some())
             .field("_flexi_logger_handles", &self._flexi_logger_handles.is_some())
+            .field("_tracing_guard", &self._tracing_guard.is_some())
             .finish()
     }
 }
@@ -277,13 +281,18 @@ pub(crate) fn init_telemetry(config: &OtelConfig) -> OtelGuard {
                     .with_thread_names(true)
                     .with_thread_ids(true)
                     .with_file(true)
-                    .with_line_number(true);
+                    .with_line_number(true)
+                    .json()
+                    .with_current_span(true)
+                    .with_span_list(true);
+                let span_event = if is_production {
+                    FmtSpan::CLOSE
+                } else {
+                    // Only add full span events tracking in the development environment
+                    FmtSpan::FULL
+                };
 
-                // Only add full span events tracking in the development environment
-                if !is_production {
-                    layer = layer.with_span_events(FmtSpan::FULL);
-                }
-
+                layer = layer.with_span_events(span_event);
                 layer.with_filter(build_env_filter(logger_level, None))
             };
 
@@ -295,7 +304,7 @@ pub(crate) fn init_telemetry(config: &OtelConfig) -> OtelGuard {
             tracing_subscriber::registry()
                 .with(filter)
                 .with(ErrorLayer::default())
-                .with(if config.local_logging_enabled.unwrap_or(DEFAULT_LOG_LOCAL_LOGGING_ENABLED) {
+                .with(if config.log_stdout_enabled.unwrap_or(DEFAULT_OBS_LOG_STDOUT_ENABLED) {
                     Some(fmt_layer)
                 } else {
                     None
@@ -321,6 +330,7 @@ pub(crate) fn init_telemetry(config: &OtelConfig) -> OtelGuard {
             meter_provider: Some(meter_provider),
             logger_provider: Some(logger_provider),
             _flexi_logger_handles: flexi_logger_handle,
+            _tracing_guard: None,
         };
     }
 
@@ -350,6 +360,70 @@ pub(crate) fn init_telemetry(config: &OtelConfig) -> OtelGuard {
                 eprintln!("This may affect log file access. Consider checking directory ownership and permissions.");
             }
         }
+    }
+
+    if endpoint.is_empty() && !is_production {
+        // Create a file appender (rolling by day), add the -tracing suffix to the file name to avoid conflicts
+        // let file_appender = tracing_appender::rolling::hourly(log_directory, format!("{log_filename}-tracing.log"));
+        let file_appender = RollingFileAppender::builder()
+            .rotation(Rotation::HOURLY) // rotate log files once every hour
+            .filename_prefix(format!("{log_filename}-tracing")) // log file names will be prefixed with `myapp.`
+            .filename_suffix("log") // log file names will be suffixed with `.log`
+            .build(log_directory) // try to build an appender that stores log files in `/var/log`
+            .expect("initializing rolling file appender failed");
+        let (nb_writer, guard) = tracing_appender::non_blocking(file_appender);
+
+        let enable_color = std::io::stdout().is_terminal();
+        let fmt_layer = tracing_subscriber::fmt::layer()
+            .with_timer(LocalTime::rfc_3339())
+            .with_target(true)
+            .with_ansi(enable_color)
+            .with_thread_names(true)
+            .with_thread_ids(true)
+            .with_file(true)
+            .with_line_number(true)
+            .with_writer(nb_writer) // Specify writing file
+            .json()
+            .with_current_span(true)
+            .with_span_list(true)
+            .with_span_events(FmtSpan::CLOSE); // Log span lifecycle events, including trace_id
+
+        let env_filter = build_env_filter(logger_level, None);
+
+        // Use registry() to register fmt_layer directly to ensure trace_id is output to the log
+        tracing_subscriber::registry()
+            .with(env_filter)
+            .with(ErrorLayer::default())
+            .with(fmt_layer)
+            .with(if config.log_stdout_enabled.unwrap_or(DEFAULT_OBS_LOG_STDOUT_ENABLED) {
+                let stdout_fmt_layer = tracing_subscriber::fmt::layer()
+                    .with_timer(LocalTime::rfc_3339())
+                    .with_target(true)
+                    .with_thread_names(true)
+                    .with_thread_ids(true)
+                    .with_file(true)
+                    .with_line_number(true)
+                    .with_writer(std::io::stdout) // Specify writing file
+                    .json()
+                    .with_current_span(true)
+                    .with_span_list(true)
+                    .with_span_events(FmtSpan::CLOSE); // Log span lifecycle events, including trace_id;
+                Some(stdout_fmt_layer)
+            } else {
+                None
+            })
+            .init();
+
+        info!("Tracing telemetry initialized for non-production with trace_id logging.");
+        IS_OBSERVABILITY_ENABLED.set(false).ok();
+
+        return OtelGuard {
+            tracer_provider: None,
+            meter_provider: None,
+            logger_provider: None,
+            _flexi_logger_handles: None,
+            _tracing_guard: Some(guard),
+        };
     }
 
     // Build log cutting conditions
@@ -447,7 +521,6 @@ pub(crate) fn init_telemetry(config: &OtelConfig) -> OtelGuard {
 
     // Environment-aware stdout configuration
     flexi_logger_builder = flexi_logger_builder.duplicate_to_stdout(level_filter);
-
     // Only add stdout formatting and startup messages in non-production environments
     if !is_production {
         flexi_logger_builder = flexi_logger_builder
@@ -496,6 +569,7 @@ pub(crate) fn init_telemetry(config: &OtelConfig) -> OtelGuard {
         meter_provider: None,
         logger_provider: None,
         _flexi_logger_handles: flexi_logger_handle,
+        _tracing_guard: None,
     }
 }
 

@@ -12,12 +12,12 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::error::{Error, Result};
 use crate::heal::{
     progress::HealProgress,
     resume::{CheckpointManager, ResumeManager, ResumeUtils},
     storage::HealStorageAPI,
 };
+use crate::{Error, Result};
 use futures::future::join_all;
 use rustfs_common::heal_channel::{HealOpts, HealScanMode};
 use rustfs_ecstore::disk::DiskStore;
@@ -56,7 +56,7 @@ impl ErasureSetHealer {
         let task_id = self.get_or_create_task_id(set_disk_id).await?;
 
         // 2. initialize or resume resume state
-        let (resume_manager, checkpoint_manager) = self.initialize_resume_state(&task_id, buckets).await?;
+        let (resume_manager, checkpoint_manager) = self.initialize_resume_state(&task_id, set_disk_id, buckets).await?;
 
         // 3. execute heal with resume
         let result = self
@@ -77,25 +77,38 @@ impl ErasureSetHealer {
     }
 
     /// get or create task id
-    async fn get_or_create_task_id(&self, _set_disk_id: &str) -> Result<String> {
+    async fn get_or_create_task_id(&self, set_disk_id: &str) -> Result<String> {
         // check if there are resumable tasks
         let resumable_tasks = ResumeUtils::get_resumable_tasks(&self.disk).await?;
 
         for task_id in resumable_tasks {
-            if ResumeUtils::can_resume_task(&self.disk, &task_id).await {
-                info!("Found resumable task: {}", task_id);
-                return Ok(task_id);
+            match ResumeManager::load_from_disk(self.disk.clone(), &task_id).await {
+                Ok(manager) => {
+                    let state = manager.get_state().await;
+                    if state.set_disk_id == set_disk_id && ResumeUtils::can_resume_task(&self.disk, &task_id).await {
+                        info!("Found resumable task: {} for set {}", task_id, set_disk_id);
+                        return Ok(task_id);
+                    }
+                }
+                Err(e) => {
+                    warn!("Failed to load resume state for task {}: {}", task_id, e);
+                }
             }
         }
 
         // create new task id
-        let task_id = ResumeUtils::generate_task_id();
+        let task_id = format!("{}_{}", set_disk_id, ResumeUtils::generate_task_id());
         info!("Created new heal task: {}", task_id);
         Ok(task_id)
     }
 
     /// initialize or resume resume state
-    async fn initialize_resume_state(&self, task_id: &str, buckets: &[String]) -> Result<(ResumeManager, CheckpointManager)> {
+    async fn initialize_resume_state(
+        &self,
+        task_id: &str,
+        set_disk_id: &str,
+        buckets: &[String],
+    ) -> Result<(ResumeManager, CheckpointManager)> {
         // check if resume state exists
         if ResumeManager::has_resume_state(&self.disk, task_id).await {
             info!("Loading existing resume state for task: {}", task_id);
@@ -111,8 +124,14 @@ impl ErasureSetHealer {
         } else {
             info!("Creating new resume state for task: {}", task_id);
 
-            let resume_manager =
-                ResumeManager::new(self.disk.clone(), task_id.to_string(), "erasure_set".to_string(), buckets.to_vec()).await?;
+            let resume_manager = ResumeManager::new(
+                self.disk.clone(),
+                task_id.to_string(),
+                "erasure_set".to_string(),
+                set_disk_id.to_string(),
+                buckets.to_vec(),
+            )
+            .await?;
 
             let checkpoint_manager = CheckpointManager::new(self.disk.clone(), task_id.to_string()).await?;
 
@@ -162,6 +181,7 @@ impl ErasureSetHealer {
             let bucket_result = self
                 .heal_bucket_with_resume(
                     bucket,
+                    bucket_idx,
                     &mut current_object_index,
                     &mut processed_objects,
                     &mut successful_objects,
@@ -182,7 +202,7 @@ impl ErasureSetHealer {
 
             // check cancel status
             if self.cancel_token.is_cancelled() {
-                info!("Heal task cancelled");
+                warn!("Heal task cancelled");
                 return Err(Error::TaskCancelled);
             }
 
@@ -214,6 +234,7 @@ impl ErasureSetHealer {
     async fn heal_bucket_with_resume(
         &self,
         bucket: &str,
+        bucket_index: usize,
         current_object_index: &mut usize,
         processed_objects: &mut u64,
         successful_objects: &mut u64,
@@ -222,7 +243,7 @@ impl ErasureSetHealer {
         resume_manager: &ResumeManager,
         checkpoint_manager: &CheckpointManager,
     ) -> Result<()> {
-        info!("Starting heal for bucket: {} from object index {}", bucket, current_object_index);
+        info!(target: "rustfs:ahm:heal_bucket_with_resume" ,"Starting heal for bucket: {} from object index {}", bucket, current_object_index);
 
         // 1. get bucket info
         let _bucket_info = match self.storage.get_bucket_info(bucket).await? {
@@ -260,7 +281,7 @@ impl ErasureSetHealer {
 
             if !object_exists {
                 info!(
-                    "Object {}/{} no longer exists, skipping heal (likely deleted intentionally)",
+                    target: "rustfs:ahm:heal_bucket_with_resume" ,"Object {}/{} no longer exists, skipping heal (likely deleted intentionally)",
                     bucket, object
                 );
                 checkpoint_manager.add_processed_object(object.clone()).await?;
@@ -306,7 +327,9 @@ impl ErasureSetHealer {
 
             // save checkpoint periodically
             if obj_idx % 100 == 0 {
-                checkpoint_manager.update_position(0, *current_object_index).await?;
+                checkpoint_manager
+                    .update_position(bucket_index, *current_object_index)
+                    .await?;
             }
         }
 
@@ -337,7 +360,10 @@ impl ErasureSetHealer {
             let cancel_token = self.cancel_token.clone();
 
             async move {
-                let _permit = semaphore.acquire().await.unwrap();
+                let _permit = semaphore
+                    .acquire()
+                    .await
+                    .map_err(|e| Error::other(format!("Failed to acquire semaphore for bucket heal: {}", e)))?;
 
                 if cancel_token.is_cancelled() {
                     return Err(Error::TaskCancelled);
@@ -432,7 +458,10 @@ impl ErasureSetHealer {
             let semaphore = semaphore.clone();
 
             async move {
-                let _permit = semaphore.acquire().await.unwrap();
+                let _permit = semaphore
+                    .acquire()
+                    .await
+                    .map_err(|e| Error::other(format!("Failed to acquire semaphore for object heal: {}", e)))?;
 
                 match storage.heal_object(&bucket, &object, None, &heal_opts).await {
                     Ok((_result, None)) => {

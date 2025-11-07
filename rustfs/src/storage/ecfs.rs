@@ -77,7 +77,7 @@ use rustfs_ecstore::{
     },
 };
 use rustfs_filemeta::REPLICATE_INCOMING_DELETE;
-use rustfs_filemeta::fileinfo::{ObjectPartInfo, RestoreStatusOps};
+use rustfs_filemeta::{ObjectPartInfo, RestoreStatusOps};
 use rustfs_filemeta::{ReplicationStatusType, ReplicationType, VersionPurgeStatusType};
 use rustfs_kms::{
     DataKey,
@@ -1342,7 +1342,7 @@ impl S3 for FS {
             }
 
             if is_dir_object(&object.object_name) && object.version_id.is_none() {
-                object.version_id = Some(Uuid::nil());
+                object.version_id = Some(Uuid::max());
             }
 
             if replicate_deletes {
@@ -2164,12 +2164,7 @@ impl S3 for FS {
         } = req.input;
 
         let prefix = prefix.unwrap_or_default();
-        let max_keys = match max_keys {
-            Some(v) if v > 0 && v <= 1000 => v,
-            Some(v) if v > 1000 => 1000,
-            None => 1000,
-            _ => return Err(s3_error!(InvalidArgument, "max-keys must be between 1 and 1000")),
-        };
+        let max_keys = max_keys.unwrap_or(1000);
 
         let delimiter = delimiter.filter(|v| !v.is_empty());
         let start_after = start_after.filter(|v| !v.is_empty());
@@ -2218,6 +2213,7 @@ impl S3 for FS {
                     last_modified: v.mod_time.map(Timestamp::from),
                     size: Some(v.get_actual_size().unwrap_or_default()),
                     e_tag: v.etag.clone().map(|etag| to_s3s_etag(&etag)),
+                    storage_class: v.storage_class.clone().map(ObjectStorageClass::from),
                     ..Default::default()
                 };
 
@@ -3202,7 +3198,7 @@ impl S3 for FS {
 
             range_spec
                 .get_offset_length(validation_size)
-                .map_err(|e| S3Error::with_message(S3ErrorCode::InvalidRange, format!("Invalid range: {e}")))?
+                .map_err(|e| S3Error::with_message(S3ErrorCode::InvalidRange, e.to_string()))?
         } else {
             (0, src_info.size)
         };
@@ -4164,6 +4160,13 @@ impl S3 for FS {
         let object_lock_configuration = match metadata_sys::get_object_lock_config(&bucket).await {
             Ok((cfg, _created)) => Some(cfg),
             Err(err) => {
+                if err == StorageError::ConfigNotFound {
+                    return Err(S3Error::with_message(
+                        S3ErrorCode::ObjectLockConfigurationNotFoundError,
+                        "Object Lock configuration does not exist for this bucket".to_string(),
+                    ));
+                }
+
                 debug!("get_object_lock_config err {:?}", err);
                 None
             }

@@ -12,6 +12,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use crate::Result;
+use crate::scanner::LoadLevel;
+use serde::{Deserialize, Serialize};
 use std::{
     collections::VecDeque,
     sync::{
@@ -20,14 +23,9 @@ use std::{
     },
     time::{Duration, SystemTime},
 };
-
-use serde::{Deserialize, Serialize};
 use tokio::sync::RwLock;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
-
-use super::node_scanner::LoadLevel;
-use crate::error::Result;
 
 /// IO monitor config   
 #[derive(Debug, Clone)]
