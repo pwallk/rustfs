@@ -180,8 +180,7 @@ impl HealStorageAPI for ECStoreHealStorage {
                             MAX_READ_BYTES, bucket, object
                         );
                         return Err(Error::other(format!(
-                            "Object too large: {} bytes (max: {} bytes) for {}/{}",
-                            n_read, MAX_READ_BYTES, bucket, object
+                            "Object too large: {n_read} bytes (max: {MAX_READ_BYTES} bytes) for {bucket}/{object}"
                         )));
                     }
                 }
@@ -499,7 +498,7 @@ impl HealStorageAPI for ECStoreHealStorage {
         match self
             .ecstore
             .clone()
-            .list_objects_v2(bucket, prefix, None, None, 1000, false, None)
+            .list_objects_v2(bucket, prefix, None, None, 1000, false, None, false)
             .await
         {
             Ok(list_info) => {
