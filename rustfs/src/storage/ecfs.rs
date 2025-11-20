@@ -121,6 +121,7 @@ use rustfs_utils::{
 use rustfs_zip::CompressionFormat;
 use s3s::header::{X_AMZ_RESTORE, X_AMZ_RESTORE_OUTPUT_PATH};
 use s3s::{S3, S3Error, S3ErrorCode, S3Request, S3Response, S3Result, dto::*, s3_error};
+use std::ops::Add;
 use std::{
     collections::HashMap,
     fmt::Debug,
@@ -1618,6 +1619,10 @@ impl S3 for FS {
             version_id,
             part_number,
             range,
+            if_none_match,
+            if_match,
+            if_modified_since,
+            if_unmodified_since,
             ..
         } = req.input.clone();
 
@@ -1664,6 +1669,36 @@ impl S3 for FS {
             .map_err(ApiError::from)?;
 
         let info = reader.object_info;
+
+        if let Some(match_etag) = if_none_match {
+            if info.etag.as_ref().is_some_and(|etag| etag == match_etag.as_str()) {
+                return Err(S3Error::new(S3ErrorCode::NotModified));
+            }
+        }
+
+        if let Some(modified_since) = if_modified_since {
+            // obj_time < givenTime + 1s
+            if info.mod_time.is_some_and(|mod_time| {
+                let give_time: OffsetDateTime = modified_since.into();
+                mod_time < give_time.add(time::Duration::seconds(1))
+            }) {
+                return Err(S3Error::new(S3ErrorCode::NotModified));
+            }
+        }
+
+        if let Some(match_etag) = if_match {
+            if info.etag.as_ref().is_some_and(|etag| etag != match_etag.as_str()) {
+                return Err(S3Error::new(S3ErrorCode::PreconditionFailed));
+            }
+        } else if let Some(unmodified_since) = if_unmodified_since {
+            if info.mod_time.is_some_and(|mod_time| {
+                let give_time: OffsetDateTime = unmodified_since.into();
+                mod_time > give_time.add(time::Duration::seconds(1))
+            }) {
+                return Err(S3Error::new(S3ErrorCode::PreconditionFailed));
+            }
+        }
+
         debug!(object_size = info.size, part_count = info.parts.len(), "GET object metadata snapshot");
         for part in &info.parts {
             debug!(
@@ -1976,6 +2011,10 @@ impl S3 for FS {
             version_id,
             part_number,
             range,
+            if_none_match,
+            if_match,
+            if_modified_since,
+            if_unmodified_since,
             ..
         } = req.input.clone();
 
@@ -2013,6 +2052,35 @@ impl S3 for FS {
         };
 
         let info = store.get_object_info(&bucket, &key, &opts).await.map_err(ApiError::from)?;
+
+        if let Some(match_etag) = if_none_match {
+            if info.etag.as_ref().is_some_and(|etag| etag == match_etag.as_str()) {
+                return Err(S3Error::new(S3ErrorCode::NotModified));
+            }
+        }
+
+        if let Some(modified_since) = if_modified_since {
+            // obj_time < givenTime + 1s
+            if info.mod_time.is_some_and(|mod_time| {
+                let give_time: OffsetDateTime = modified_since.into();
+                mod_time < give_time.add(time::Duration::seconds(1))
+            }) {
+                return Err(S3Error::new(S3ErrorCode::NotModified));
+            }
+        }
+
+        if let Some(match_etag) = if_match {
+            if info.etag.as_ref().is_some_and(|etag| etag != match_etag.as_str()) {
+                return Err(S3Error::new(S3ErrorCode::PreconditionFailed));
+            }
+        } else if let Some(unmodified_since) = if_unmodified_since {
+            if info.mod_time.is_some_and(|mod_time| {
+                let give_time: OffsetDateTime = unmodified_since.into();
+                mod_time > give_time.add(time::Duration::seconds(1))
+            }) {
+                return Err(S3Error::new(S3ErrorCode::PreconditionFailed));
+            }
+        }
 
         let event_info = info.clone();
         let content_type = {
@@ -2120,15 +2188,20 @@ impl S3 for FS {
             return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));
         };
 
-        let mut bucket_infos = store.list_bucket(&BucketOptions::default()).await.map_err(ApiError::from)?;
-
         let mut req = req;
 
-        if authorize_request(&mut req, Action::S3Action(S3Action::ListAllMyBucketsAction))
-            .await
-            .is_err()
-        {
-            bucket_infos = futures::stream::iter(bucket_infos)
+        if req.credentials.as_ref().is_none_or(|cred| cred.access_key.is_empty()) {
+            return Err(S3Error::with_message(S3ErrorCode::AccessDenied, "Access Denied"));
+        }
+
+        let bucket_infos = if let Err(e) = authorize_request(&mut req, Action::S3Action(S3Action::ListAllMyBucketsAction)).await {
+            if e.code() != &S3ErrorCode::AccessDenied {
+                return Err(e);
+            }
+
+            let mut list_bucket_infos = store.list_bucket(&BucketOptions::default()).await.map_err(ApiError::from)?;
+
+            list_bucket_infos = futures::stream::iter(list_bucket_infos)
                 .filter_map(|info| async {
                     let mut req_clone = req.clone();
                     let req_info = req_clone.extensions.get_mut::<ReqInfo>().expect("ReqInfo not found");
@@ -2148,7 +2221,14 @@ impl S3 for FS {
                 })
                 .collect()
                 .await;
-        }
+
+            if list_bucket_infos.is_empty() {
+                return Err(S3Error::with_message(S3ErrorCode::AccessDenied, "Access Denied"));
+            }
+            list_bucket_infos
+        } else {
+            store.list_bucket(&BucketOptions::default()).await.map_err(ApiError::from)?
+        };
 
         let buckets: Vec<Bucket> = bucket_infos
             .iter()
@@ -2416,8 +2496,42 @@ impl S3 for FS {
             sse_customer_key_md5,
             ssekms_key_id,
             content_md5,
+            if_match,
+            if_none_match,
             ..
         } = input;
+
+        if if_match.is_some() || if_none_match.is_some() {
+            let Some(store) = new_object_layer_fn() else {
+                return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));
+            };
+
+            match store.get_object_info(&bucket, &key, &ObjectOptions::default()).await {
+                Ok(info) => {
+                    if !info.delete_marker {
+                        if let Some(ifmatch) = if_match {
+                            if info.etag.as_ref().is_some_and(|etag| etag != ifmatch.as_str()) {
+                                return Err(s3_error!(PreconditionFailed));
+                            }
+                        }
+                        if let Some(ifnonematch) = if_none_match {
+                            if info.etag.as_ref().is_some_and(|etag| etag == ifnonematch.as_str()) {
+                                return Err(s3_error!(PreconditionFailed));
+                            }
+                        }
+                    }
+                }
+                Err(err) => {
+                    if !is_err_object_not_found(&err) || !is_err_version_not_found(&err) {
+                        return Err(ApiError::from(err).into());
+                    }
+
+                    if if_match.is_some() && (is_err_object_not_found(&err) || is_err_version_not_found(&err)) {
+                        return Err(ApiError::from(err).into());
+                    }
+                }
+            }
+        }
 
         let Some(body) = body else { return Err(s3_error!(IncompleteBody)) };
 
@@ -3453,8 +3567,42 @@ impl S3 for FS {
             bucket,
             key,
             upload_id,
+            if_match,
+            if_none_match,
             ..
         } = input;
+
+        if if_match.is_some() || if_none_match.is_some() {
+            let Some(store) = new_object_layer_fn() else {
+                return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));
+            };
+
+            match store.get_object_info(&bucket, &key, &ObjectOptions::default()).await {
+                Ok(info) => {
+                    if !info.delete_marker {
+                        if let Some(ifmatch) = if_match {
+                            if info.etag.as_ref().is_some_and(|etag| etag != ifmatch.as_str()) {
+                                return Err(s3_error!(PreconditionFailed));
+                            }
+                        }
+                        if let Some(ifnonematch) = if_none_match {
+                            if info.etag.as_ref().is_some_and(|etag| etag == ifnonematch.as_str()) {
+                                return Err(s3_error!(PreconditionFailed));
+                            }
+                        }
+                    }
+                }
+                Err(err) => {
+                    if !is_err_object_not_found(&err) || !is_err_version_not_found(&err) {
+                        return Err(ApiError::from(err).into());
+                    }
+
+                    if if_match.is_some() && (is_err_object_not_found(&err) || is_err_version_not_found(&err)) {
+                        return Err(ApiError::from(err).into());
+                    }
+                }
+            }
+        }
 
         let Some(multipart_upload) = multipart_upload else { return Err(s3_error!(InvalidPart)) };
 
