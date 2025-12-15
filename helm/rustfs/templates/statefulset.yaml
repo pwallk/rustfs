@@ -15,6 +15,10 @@ spec:
       labels:
         app: {{ include "rustfs.name" . }}
     spec:
+      {{- with include "chart.imagePullSecrets" . }}
+      imagePullSecrets:
+        {{- . | nindent 8 }}
+      {{- end }}
       {{- if .Values.podSecurityContext }}
       securityContext:
       {{- toYaml .Values.podSecurityContext | nindent 12 }}
@@ -122,7 +126,7 @@ spec:
         storageClassName: {{ $.Values.storageclass.name }}
         resources:
           requests:
-            storage: {{ $.Values.storageclass.size}}
+            storage: {{ $.Values.storageclass.logStorageSize}}
     {{- if eq (int .Values.replicaCount) 4 }}
     {{- range $i := until (int .Values.replicaCount) }}
     - metadata:
@@ -132,7 +136,7 @@ spec:
         storageClassName: {{ $.Values.storageclass.name }}
         resources:
           requests:
-            storage: {{ $.Values.storageclass.size}}
+            storage: {{ $.Values.storageclass.dataStorageSize}}
     {{- end }}
     {{- else if eq (int .Values.replicaCount) 16 }}
     - metadata:
@@ -142,6 +146,6 @@ spec:
         storageClassName: {{ $.Values.storageclass.name }}
         resources:
           requests:
-            storage: {{ $.Values.storageclass.size}}
+            storage: {{ $.Values.storageclass.dataStorageSize}}
     {{- end }}
 {{- end }}
