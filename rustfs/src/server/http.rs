@@ -17,11 +17,11 @@ use super::compress::{CompressionConfig, CompressionPredicate};
 use crate::admin;
 use crate::auth::IAMAuth;
 use crate::config;
-use crate::server::{ServiceState, ServiceStateManager, hybrid::hybrid, layer::RedirectLayer};
+use crate::server::{ReadinessGateLayer, RemoteAddr, ServiceState, ServiceStateManager, hybrid::hybrid, layer::RedirectLayer};
 use crate::storage;
 use crate::storage::tonic_service::make_server;
 use bytes::Bytes;
-use http::{HeaderMap, Request as HttpRequest, Response};
+use http::{HeaderMap, Method, Request as HttpRequest, Response};
 use hyper_util::{
     rt::{TokioExecutor, TokioIo},
     server::conn::auto::Builder as ConnBuilder,
@@ -29,7 +29,12 @@ use hyper_util::{
     service::TowerToHyperService,
 };
 use metrics::{counter, histogram};
-use rustfs_config::{DEFAULT_ACCESS_KEY, DEFAULT_SECRET_KEY, MI_B, RUSTFS_TLS_CERT, RUSTFS_TLS_KEY};
+use rustfs_common::GlobalReadiness;
+#[cfg(not(target_os = "openbsd"))]
+use rustfs_config::{MI_B, RUSTFS_TLS_CERT, RUSTFS_TLS_KEY};
+#[cfg(target_os = "openbsd")]
+use rustfs_config::{RUSTFS_TLS_CERT, RUSTFS_TLS_KEY};
+use rustfs_ecstore::rpc::{TONIC_RPC_PREFIX, verify_rpc_signature};
 use rustfs_protos::proto_gen::node_service::node_service_server::NodeServiceServer;
 use rustfs_utils::net::parse_and_resolve_address;
 use rustls::ServerConfig;
@@ -41,8 +46,9 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::net::{TcpListener, TcpStream};
 use tokio_rustls::TlsAcceptor;
-use tonic::{Request, Status, metadata::MetadataValue};
+use tonic::{Request, Status};
 use tower::ServiceBuilder;
+use tower_http::add_extension::AddExtensionLayer;
 use tower_http::catch_panic::CatchPanicLayer;
 use tower_http::compression::CompressionLayer;
 use tower_http::cors::{AllowOrigin, Any, CorsLayer};
@@ -112,6 +118,7 @@ fn get_cors_allowed_origins() -> String {
 pub async fn start_http_server(
     opt: &config::Opt,
     worker_state_manager: ServiceStateManager,
+    readiness: Arc<GlobalReadiness>,
 ) -> Result<tokio::sync::broadcast::Sender<()>> {
     let server_addr = parse_and_resolve_address(opt.address.as_str()).map_err(Error::other)?;
     let server_port = server_addr.port();
@@ -119,20 +126,30 @@ pub async fn start_http_server(
     // The listening address and port are obtained from the parameters
     let listener = {
         let mut server_addr = server_addr;
-        let mut socket = socket2::Socket::new(
+
+        // Try to create a socket for the address family; if that fails, fallback to IPv4.
+        let mut socket = match socket2::Socket::new(
             socket2::Domain::for_address(server_addr),
             socket2::Type::STREAM,
             Some(socket2::Protocol::TCP),
-        )?;
-
-        if server_addr.is_ipv6() {
-            if let Err(e) = socket.set_only_v6(false) {
-                warn!("Failed to set IPV6_V6ONLY=false, falling back to IPv4-only: {}", e);
-                // Fallback to a new IPv4 socket if setting dual-stack fails.
+        ) {
+            Ok(s) => s,
+            Err(e) => {
+                warn!("Failed to create socket for {:?}: {}, falling back to IPv4", server_addr, e);
                 let ipv4_addr = SocketAddr::new(std::net::Ipv4Addr::UNSPECIFIED.into(), server_addr.port());
                 server_addr = ipv4_addr;
-                socket = socket2::Socket::new(socket2::Domain::IPV4, socket2::Type::STREAM, Some(socket2::Protocol::TCP))?;
+                socket2::Socket::new(socket2::Domain::IPV4, socket2::Type::STREAM, Some(socket2::Protocol::TCP))?
             }
+        };
+
+        // If address is IPv6 try to enable dual-stack; on failure, switch to IPv4 socket.
+        if server_addr.is_ipv6()
+            && let Err(e) = socket.set_only_v6(false)
+        {
+            warn!("Failed to set IPV6_V6ONLY=false, attempting IPv4 fallback: {}", e);
+            let ipv4_addr = SocketAddr::new(std::net::Ipv4Addr::UNSPECIFIED.into(), server_addr.port());
+            server_addr = ipv4_addr;
+            socket = socket2::Socket::new(socket2::Domain::IPV4, socket2::Type::STREAM, Some(socket2::Protocol::TCP))?;
         }
 
         // Common setup for both IPv4 and successful dual-stack IPv6
@@ -140,11 +157,33 @@ pub async fn start_http_server(
         socket.set_reuse_address(true)?;
         // Set the socket to non-blocking before passing it to Tokio.
         socket.set_nonblocking(true)?;
-        socket.bind(&server_addr.into())?;
-        socket.listen(backlog)?;
+
+        // Attempt bind; if bind fails for IPv6, try IPv4 fallback once more.
+        if let Err(bind_err) = socket.bind(&server_addr.into()) {
+            warn!("Failed to bind to {}: {}.", server_addr, bind_err);
+            if server_addr.is_ipv6() {
+                // Try IPv4 fallback
+                let ipv4_addr = SocketAddr::new(std::net::Ipv4Addr::UNSPECIFIED.into(), server_addr.port());
+                server_addr = ipv4_addr;
+                socket = socket2::Socket::new(socket2::Domain::IPV4, socket2::Type::STREAM, Some(socket2::Protocol::TCP))?;
+                socket.set_reuse_address(true)?;
+                socket.set_nonblocking(true)?;
+                socket.bind(&server_addr.into())?;
+                // [FIX] Ensure fallback socket is moved to listening state as well.
+                socket.listen(backlog)?;
+            } else {
+                return Err(bind_err);
+            }
+        } else {
+            // Listen on the socket when initial bind succeeded
+            socket.listen(backlog)?;
+        }
         TcpListener::from_std(socket.into())?
     };
 
+    let tls_acceptor = setup_tls_acceptor(opt.tls_path.as_deref().unwrap_or_default()).await?;
+    let tls_enabled = tls_acceptor.is_some();
+    let protocol = if tls_enabled { "https" } else { "http" };
     // Obtain the listener address
     let local_addr: SocketAddr = listener.local_addr()?;
     let local_ip = match rustfs_utils::get_local_ip() {
@@ -154,11 +193,15 @@ pub async fn start_http_server(
             local_addr.ip()
         }
     };
-    let tls_acceptor = setup_tls_acceptor(opt.tls_path.as_deref().unwrap_or_default()).await?;
-    let tls_enabled = tls_acceptor.is_some();
-    let protocol = if tls_enabled { "https" } else { "http" };
+
+    let local_ip_str = if local_ip.is_ipv6() {
+        format!("[{local_ip}]")
+    } else {
+        local_ip.to_string()
+    };
+
     // Detailed endpoint information (showing all API endpoints)
-    let api_endpoints = format!("{protocol}://{local_ip}:{server_port}");
+    let api_endpoints = format!("{protocol}://{local_ip_str}:{server_port}");
     let localhost_endpoint = format!("{protocol}://127.0.0.1:{server_port}");
     let now_time = chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string();
     if opt.console_enable {
@@ -166,7 +209,7 @@ pub async fn start_http_server(
 
         info!(
             target: "rustfs::console::startup",
-            "Console WebUI available at: {protocol}://{local_ip}:{server_port}/rustfs/console/index.html"
+            "Console WebUI available at: {protocol}://{local_ip_str}:{server_port}/rustfs/console/index.html"
         );
         info!(
             target: "rustfs::console::startup",
@@ -175,16 +218,19 @@ pub async fn start_http_server(
         );
 
         println!("Console WebUI Start Time: {now_time}");
-        println!("Console WebUI available at: {protocol}://{local_ip}:{server_port}/rustfs/console/index.html");
+        println!("Console WebUI available at: {protocol}://{local_ip_str}:{server_port}/rustfs/console/index.html");
         println!("Console WebUI (localhost): {protocol}://127.0.0.1:{server_port}/rustfs/console/index.html",);
     } else {
         info!(target: "rustfs::main::startup","RustFS API: {api_endpoints}  {localhost_endpoint}");
-        println!("RustFS API: {api_endpoints}  {localhost_endpoint}");
+        println!("RustFS Http API: {api_endpoints}  {localhost_endpoint}");
         println!("RustFS Start Time: {now_time}");
-        if DEFAULT_ACCESS_KEY.eq(&opt.access_key) && DEFAULT_SECRET_KEY.eq(&opt.secret_key) {
+        if rustfs_credentials::DEFAULT_ACCESS_KEY.eq(&opt.access_key)
+            && rustfs_credentials::DEFAULT_SECRET_KEY.eq(&opt.secret_key)
+        {
             warn!(
                 "Detected default credentials '{}:{}', we recommend that you change these values with 'RUSTFS_ACCESS_KEY' and 'RUSTFS_SECRET_KEY' environment variables",
-                DEFAULT_ACCESS_KEY, DEFAULT_SECRET_KEY
+                rustfs_credentials::DEFAULT_ACCESS_KEY,
+                rustfs_credentials::DEFAULT_SECRET_KEY
             );
         }
         info!(target: "rustfs::main::startup","For more information, visit https://rustfs.com/docs/");
@@ -332,12 +378,11 @@ pub async fn start_http_server(
 
             // Enable TCP Keepalive to detect dead clients (e.g. power loss)
             // Idle: 10s, Interval: 5s, Retries: 3
-            let ka = TcpKeepalive::new()
-                .with_time(Duration::from_secs(10))
-                .with_interval(Duration::from_secs(5));
-
-            #[cfg(not(any(target_os = "openbsd", target_os = "netbsd")))]
-            let ka = ka.with_retries(3);
+            let mut ka = TcpKeepalive::new().with_time(Duration::from_secs(10));
+            #[cfg(not(target_os = "openbsd"))]
+            {
+                ka = ka.with_interval(Duration::from_secs(5)).with_retries(3);
+            }
 
             if let Err(err) = socket_ref.set_tcp_keepalive(&ka) {
                 warn!(?err, "Failed to set TCP_KEEPALIVE");
@@ -346,9 +391,11 @@ pub async fn start_http_server(
             if let Err(err) = socket_ref.set_tcp_nodelay(true) {
                 warn!(?err, "Failed to set TCP_NODELAY");
             }
+            #[cfg(not(any(target_os = "openbsd")))]
             if let Err(err) = socket_ref.set_recv_buffer_size(4 * MI_B) {
                 warn!(?err, "Failed to set set_recv_buffer_size");
             }
+            #[cfg(not(any(target_os = "openbsd")))]
             if let Err(err) = socket_ref.set_send_buffer_size(4 * MI_B) {
                 warn!(?err, "Failed to set set_send_buffer_size");
             }
@@ -359,6 +406,7 @@ pub async fn start_http_server(
                 cors_layer: cors_layer.clone(),
                 compression_config: compression_config.clone(),
                 is_console,
+                readiness: readiness.clone(),
             };
 
             process_connection(socket, tls_acceptor.clone(), connection_ctx, graceful.clone());
@@ -395,35 +443,41 @@ async fn setup_tls_acceptor(tls_path: &str) -> Result<Option<TlsAcceptor>> {
         debug!("TLS path is not provided or does not exist, starting with HTTP");
         return Ok(None);
     }
-
     debug!("Found TLS directory, checking for certificates");
 
     // Make sure to use a modern encryption suite
-    let _ = rustls::crypto::ring::default_provider().install_default();
+    let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+    let mtls_verifier = rustfs_utils::build_webpki_client_verifier(tls_path)?;
 
     // 1. Attempt to load all certificates in the directory (multi-certificate support, for SNI)
-    if let Ok(cert_key_pairs) = rustfs_utils::load_all_certs_from_directory(tls_path) {
-        if !cert_key_pairs.is_empty() {
-            debug!("Found {} certificates, creating SNI-aware multi-cert resolver", cert_key_pairs.len());
+    if let Ok(cert_key_pairs) = rustfs_utils::load_all_certs_from_directory(tls_path)
+        && !cert_key_pairs.is_empty()
+    {
+        debug!("Found {} certificates, creating SNI-aware multi-cert resolver", cert_key_pairs.len());
 
-            // Create an SNI-enabled certificate resolver
-            let resolver = rustfs_utils::create_multi_cert_resolver(cert_key_pairs)?;
+        // Create an SNI-enabled certificate resolver
+        let resolver = rustfs_utils::create_multi_cert_resolver(cert_key_pairs)?;
 
-            // Configure the server to enable SNI support
-            let mut server_config = ServerConfig::builder()
+        // Configure the server to enable SNI support
+        let mut server_config = if let Some(verifier) = mtls_verifier.clone() {
+            ServerConfig::builder()
+                .with_client_cert_verifier(verifier)
+                .with_cert_resolver(Arc::new(resolver))
+        } else {
+            ServerConfig::builder()
                 .with_no_client_auth()
-                .with_cert_resolver(Arc::new(resolver));
+                .with_cert_resolver(Arc::new(resolver))
+        };
 
-            // Configure ALPN protocol priority
-            server_config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec(), b"http/1.0".to_vec()];
+        // Configure ALPN protocol priority
+        server_config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec(), b"http/1.0".to_vec()];
 
-            // Log SNI requests
-            if rustfs_utils::tls_key_log() {
-                server_config.key_log = Arc::new(rustls::KeyLogFile::new());
-            }
-
-            return Ok(Some(TlsAcceptor::from(Arc::new(server_config))));
+        // Log SNI requests
+        if rustfs_utils::tls_key_log() {
+            server_config.key_log = Arc::new(rustls::KeyLogFile::new());
         }
+
+        return Ok(Some(TlsAcceptor::from(Arc::new(server_config))));
     }
 
     // 2. Revert to the traditional single-certificate mode
@@ -434,10 +488,17 @@ async fn setup_tls_acceptor(tls_path: &str) -> Result<Option<TlsAcceptor>> {
         let certs = rustfs_utils::load_certs(&cert_path).map_err(|e| rustfs_utils::certs_error(e.to_string()))?;
         let key = rustfs_utils::load_private_key(&key_path).map_err(|e| rustfs_utils::certs_error(e.to_string()))?;
 
-        let mut server_config = ServerConfig::builder()
-            .with_no_client_auth()
-            .with_single_cert(certs, key)
-            .map_err(|e| rustfs_utils::certs_error(e.to_string()))?;
+        let mut server_config = if let Some(verifier) = mtls_verifier {
+            ServerConfig::builder()
+                .with_client_cert_verifier(verifier)
+                .with_single_cert(certs, key)
+                .map_err(|e| rustfs_utils::certs_error(e.to_string()))?
+        } else {
+            ServerConfig::builder()
+                .with_no_client_auth()
+                .with_single_cert(certs, key)
+                .map_err(|e| rustfs_utils::certs_error(e.to_string()))?
+        };
 
         // Configure ALPN protocol priority
         server_config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec(), b"http/1.0".to_vec()];
@@ -461,6 +522,7 @@ struct ConnectionContext {
     cors_layer: CorsLayer,
     compression_config: CompressionConfig,
     is_console: bool,
+    readiness: Arc<GlobalReadiness>,
 }
 
 /// Process a single incoming TCP connection.
@@ -470,7 +532,8 @@ struct ConnectionContext {
 /// 2. Build a complete service stack for this connection, including S3, RPC services, and all middleware.
 /// 3. Use Hyper to handle HTTP requests on this connection.
 /// 4. Incorporate connections into the management of elegant closures.
-#[instrument(skip_all, fields(peer_addr = %socket.peer_addr().map(|a| a.to_string()).unwrap_or_else(|_| "unknown".to_string())))]
+#[instrument(skip_all, fields(peer_addr = %socket.peer_addr().map(|a| a.to_string()).unwrap_or_else(|_| "unknown".to_string())
+))]
 fn process_connection(
     socket: TcpStream,
     tls_acceptor: Option<Arc<TlsAcceptor>>,
@@ -484,6 +547,7 @@ fn process_connection(
             cors_layer,
             compression_config,
             is_console,
+            readiness,
         } = context;
 
         // Build services inside each connected task to avoid passing complex service types across tasks,
@@ -491,9 +555,24 @@ fn process_connection(
         let rpc_service = NodeServiceServer::with_interceptor(make_server(), check_auth);
         let service = hybrid(s3_service, rpc_service);
 
+        let remote_addr = match socket.peer_addr() {
+            Ok(addr) => Some(RemoteAddr(addr)),
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    "Failed to obtain peer address; policy evaluation may fall back to a default source IP"
+                );
+                None
+            }
+        };
+
         let hybrid_service = ServiceBuilder::new()
             .layer(SetRequestIdLayer::x_request_id(MakeRequestUuid))
             .layer(CatchPanicLayer::new())
+            .layer(AddExtensionLayer::new(remote_addr))
+            // CRITICAL: Insert ReadinessGateLayer before business logic
+            // This stops requests from hitting IAMAuth or Storage if they are not ready.
+            .layer(ReadinessGateLayer::new(readiness))
             .layer(
                 TraceLayer::new_for_http()
                     .make_span_with(|request: &HttpRequest<_>| {
@@ -648,12 +727,11 @@ fn handle_connection_error(err: &(dyn std::error::Error + 'static)) {
 
 #[allow(clippy::result_large_err)]
 fn check_auth(req: Request<()>) -> std::result::Result<Request<()>, Status> {
-    let token: MetadataValue<_> = "rustfs rpc".parse().unwrap();
-
-    match req.metadata().get("authorization") {
-        Some(t) if token == t => Ok(req),
-        _ => Err(Status::unauthenticated("No valid auth token")),
-    }
+    verify_rpc_signature(TONIC_RPC_PREFIX, &Method::GET, req.metadata().as_ref()).map_err(|e| {
+        error!("RPC signature verification failed: {}", e);
+        Status::unauthenticated("No valid auth token")
+    })?;
+    Ok(req)
 }
 
 /// Determines the listen backlog size.
@@ -661,38 +739,56 @@ fn check_auth(req: Request<()>) -> std::result::Result<Request<()>, Status> {
 /// It tries to read the system's maximum connection queue length (`somaxconn`).
 /// If reading fails, it falls back to a default value (e.g., 1024).
 /// This makes the backlog size adaptive to the system configuration.
+#[cfg(target_os = "linux")]
 fn get_listen_backlog() -> i32 {
     const DEFAULT_BACKLOG: i32 = 1024;
 
-    #[cfg(target_os = "linux")]
-    {
-        // For Linux, read from /proc/sys/net/core/somaxconn
-        match std::fs::read_to_string("/proc/sys/net/core/somaxconn") {
-            Ok(s) => s.trim().parse().unwrap_or(DEFAULT_BACKLOG),
-            Err(_) => DEFAULT_BACKLOG,
-        }
+    // For Linux, read from /proc/sys/net/core/somaxconn
+    match std::fs::read_to_string("/proc/sys/net/core/somaxconn") {
+        Ok(s) => s.trim().parse().unwrap_or(DEFAULT_BACKLOG),
+        Err(_) => DEFAULT_BACKLOG,
     }
-    #[cfg(any(target_os = "macos", target_os = "freebsd", target_os = "netbsd", target_os = "openbsd"))]
+}
+
+// For macOS and BSD variants use the syscall way of getting the connection queue length.
+#[cfg(any(target_os = "macos", target_os = "freebsd", target_os = "netbsd", target_os = "openbsd"))]
+#[allow(unsafe_code)]
+fn get_listen_backlog() -> i32 {
+    const DEFAULT_BACKLOG: i32 = 1024;
+
+    #[cfg(target_os = "openbsd")]
+    let mut name = [libc::CTL_KERN, libc::KERN_SOMAXCONN];
+    #[cfg(any(target_os = "netbsd", target_os = "macos", target_os = "freebsd"))]
+    let mut name = [libc::CTL_KERN, libc::KERN_IPC, libc::KIPC_SOMAXCONN];
+    let mut buf = [0; 1];
+    let mut buf_len = std::mem::size_of_val(&buf);
+
+    if unsafe {
+        libc::sysctl(
+            name.as_mut_ptr(),
+            name.len() as u32,
+            buf.as_mut_ptr() as *mut libc::c_void,
+            &mut buf_len,
+            std::ptr::null_mut(),
+            0,
+        )
+    } != 0
     {
-        // For macOS and BSD variants, use sysctl
-        use sysctl::Sysctl;
-        match sysctl::Ctl::new("kern.ipc.somaxconn") {
-            Ok(ctl) => match ctl.value() {
-                Ok(sysctl::CtlValue::Int(val)) => val,
-                _ => DEFAULT_BACKLOG,
-            },
-            Err(_) => DEFAULT_BACKLOG,
-        }
+        return DEFAULT_BACKLOG;
     }
-    #[cfg(not(any(
-        target_os = "linux",
-        target_os = "macos",
-        target_os = "freebsd",
-        target_os = "netbsd",
-        target_os = "openbsd"
-    )))]
-    {
-        // Fallback for Windows and other operating systems
-        DEFAULT_BACKLOG
-    }
+
+    buf[0]
+}
+
+// Fallback for Windows and other operating systems
+#[cfg(not(any(
+    target_os = "linux",
+    target_os = "macos",
+    target_os = "freebsd",
+    target_os = "netbsd",
+    target_os = "openbsd"
+)))]
+fn get_listen_backlog() -> i32 {
+    const DEFAULT_BACKLOG: i32 = 1024;
+    DEFAULT_BACKLOG
 }

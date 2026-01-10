@@ -505,6 +505,10 @@ impl FileInfo {
             ReplicationStatusType::Empty
         }
     }
+
+    pub fn shard_file_size(&self, total_length: i64) -> i64 {
+        self.erasure.shard_file_size(total_length)
+    }
 }
 
 #[derive(Debug, Default, Clone, Serialize, Deserialize)]
@@ -590,7 +594,7 @@ impl RestoreStatusOps for RestoreStatus {
     }
 }
 
-fn parse_restore_obj_status(restore_hdr: &str) -> Result<RestoreStatus> {
+pub fn parse_restore_obj_status(restore_hdr: &str) -> Result<RestoreStatus> {
     let tokens: Vec<&str> = restore_hdr.splitn(2, ",").collect();
     let progress_tokens: Vec<&str> = tokens[0].splitn(2, "=").collect();
     if progress_tokens.len() != 2 {
@@ -635,10 +639,10 @@ fn parse_restore_obj_status(restore_hdr: &str) -> Result<RestoreStatus> {
 }
 
 pub fn is_restored_object_on_disk(meta: &HashMap<String, String>) -> bool {
-    if let Some(restore_hdr) = meta.get(X_AMZ_RESTORE.as_str()) {
-        if let Ok(restore_status) = parse_restore_obj_status(restore_hdr) {
-            return restore_status.on_disk();
-        }
+    if let Some(restore_hdr) = meta.get(X_AMZ_RESTORE.as_str())
+        && let Ok(restore_status) = parse_restore_obj_status(restore_hdr)
+    {
+        return restore_status.on_disk();
     }
     false
 }

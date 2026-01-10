@@ -64,13 +64,12 @@ pub async fn del_opts(
 
     let vid = vid.map(|v| v.as_str().trim().to_owned());
 
-    if let Some(ref id) = vid {
-        if *id != Uuid::nil().to_string()
-            && let Err(err) = Uuid::parse_str(id.as_str())
-        {
-            error!("del_opts: invalid version id: {} error: {}", id, err);
-            return Err(StorageError::InvalidVersionID(bucket.to_owned(), object.to_owned(), id.clone()));
-        }
+    if let Some(ref id) = vid
+        && *id != Uuid::nil().to_string()
+        && let Err(err) = Uuid::parse_str(id.as_str())
+    {
+        error!("del_opts: invalid version id: {} error: {}", id, err);
+        return Err(StorageError::InvalidVersionID(bucket.to_owned(), object.to_owned(), id.clone()));
     }
 
     let mut opts = put_opts_from_headers(headers, metadata.clone()).map_err(|err| {
@@ -111,12 +110,11 @@ pub async fn get_opts(
 
     let vid = vid.map(|v| v.as_str().trim().to_owned());
 
-    if let Some(ref id) = vid {
-        if *id != Uuid::nil().to_string()
-            && let Err(_err) = Uuid::parse_str(id.as_str())
-        {
-            return Err(StorageError::InvalidVersionID(bucket.to_owned(), object.to_owned(), id.clone()));
-        }
+    if let Some(ref id) = vid
+        && *id != Uuid::nil().to_string()
+        && let Err(_err) = Uuid::parse_str(id.as_str())
+    {
+        return Err(StorageError::InvalidVersionID(bucket.to_owned(), object.to_owned(), id.clone()));
     }
 
     let mut opts = get_default_opts(headers, HashMap::new(), false)
@@ -187,12 +185,11 @@ pub async fn put_opts(
 
     let vid = vid.map(|v| v.as_str().trim().to_owned());
 
-    if let Some(ref id) = vid {
-        if *id != Uuid::nil().to_string()
-            && let Err(_err) = Uuid::parse_str(id.as_str())
-        {
-            return Err(StorageError::InvalidVersionID(bucket.to_owned(), object.to_owned(), id.clone()));
-        }
+    if let Some(ref id) = vid
+        && *id != Uuid::nil().to_string()
+        && let Err(_err) = Uuid::parse_str(id.as_str())
+    {
+        return Err(StorageError::InvalidVersionID(bucket.to_owned(), object.to_owned(), id.clone()));
     }
 
     let mut opts = put_opts_from_headers(headers, metadata)
@@ -333,29 +330,56 @@ pub fn extract_metadata_from_mime_with_object_name(
 }
 
 pub(crate) fn filter_object_metadata(metadata: &HashMap<String, String>) -> Option<HashMap<String, String>> {
+    // Standard HTTP headers that should NOT be returned in the Metadata field
+    // These are returned as separate response headers, not user metadata
+    const EXCLUDED_HEADERS: &[&str] = &[
+        "content-type",
+        "content-encoding",
+        "content-disposition",
+        "content-language",
+        "cache-control",
+        "expires",
+        "etag",
+        "x-amz-storage-class",
+        "x-amz-tagging",
+        "x-amz-replication-status",
+        "x-amz-server-side-encryption",
+        "x-amz-server-side-encryption-customer-algorithm",
+        "x-amz-server-side-encryption-customer-key-md5",
+        "x-amz-server-side-encryption-aws-kms-key-id",
+    ];
+
     let mut filtered_metadata = HashMap::new();
     for (k, v) in metadata {
+        // Skip internal/reserved metadata
         if k.starts_with(RESERVED_METADATA_PREFIX_LOWER) {
             continue;
         }
+
+        // Skip empty object lock values
         if v.is_empty() && (k == &X_AMZ_OBJECT_LOCK_MODE.to_string() || k == &X_AMZ_OBJECT_LOCK_RETAIN_UNTIL_DATE.to_string()) {
             continue;
         }
 
+        // Skip encryption metadata placeholders
         if k == AMZ_META_UNENCRYPTED_CONTENT_MD5 || k == AMZ_META_UNENCRYPTED_CONTENT_LENGTH {
             continue;
         }
 
         let lower_key = k.to_ascii_lowercase();
-        if let Some(key) = lower_key.strip_prefix("x-amz-meta-") {
-            filtered_metadata.insert(key.to_string(), v.to_string());
-            continue;
-        }
-        if let Some(key) = lower_key.strip_prefix("x-rustfs-meta-") {
-            filtered_metadata.insert(key.to_string(), v.to_string());
+
+        // Skip standard HTTP headers (they are returned as separate headers, not metadata)
+        if EXCLUDED_HEADERS.contains(&lower_key.as_str()) {
             continue;
         }
 
+        // Skip any x-amz-* headers that are not user metadata
+        // User metadata was stored WITHOUT the x-amz-meta- prefix by extract_metadata_from_mime
+        if lower_key.starts_with("x-amz-") {
+            continue;
+        }
+
+        // Include user-defined metadata (keys like "meta1", "custom-key", etc.)
         filtered_metadata.insert(k.clone(), v.clone());
     }
     if filtered_metadata.is_empty() {
@@ -512,12 +536,11 @@ fn skip_content_sha256_cksum(headers: &HeaderMap<HeaderValue>) -> bool {
             // such broken clients and content-length > 0.
             // For now, we'll assume strict compatibility is disabled
             // In a real implementation, you would check a global config
-            if let Some(content_length) = headers.get("content-length") {
-                if let Ok(length_str) = content_length.to_str() {
-                    if let Ok(length) = length_str.parse::<i64>() {
-                        return length > 0; // && !global_server_ctxt.strict_s3_compat
-                    }
-                }
+            if let Some(content_length) = headers.get("content-length")
+                && let Ok(length_str) = content_length.to_str()
+                && let Ok(length) = length_str.parse::<i64>()
+            {
+                return length > 0; // && !global_server_ctxt.strict_s3_compat
             }
             false
         }
@@ -546,10 +569,10 @@ fn get_content_sha256_cksum(headers: &HeaderMap<HeaderValue>, service_type: Serv
     };
 
     // We found 'X-Amz-Content-Sha256' return the captured value.
-    if let Some(header_value) = content_sha256 {
-        if let Ok(value) = header_value.to_str() {
-            return value.to_string();
-        }
+    if let Some(header_value) = content_sha256
+        && let Ok(value) = header_value.to_str()
+    {
+        return value.to_string();
     }
 
     // We couldn't find 'X-Amz-Content-Sha256'.

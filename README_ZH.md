@@ -11,11 +11,17 @@
 </p>
 
 <p align="center">
+<a href="https://trendshift.io/repositories/14181" target="_blank"><img src="https://trendshift.io/api/badge/repositories/14181" alt="rustfs%2Frustfs | Trendshift" style="width: 250px; height: 55px;" width="250" height="55"/></a>
+</p>
+
+<p align="center">
   <a href="https://docs.rustfs.com/installation/">快速开始</a>
   · <a href="https://docs.rustfs.com/">文档</a>
   · <a href="https://github.com/rustfs/rustfs/issues">报告 Bug</a>
   · <a href="https://github.com/rustfs/rustfs/discussions">社区讨论</a>
 </p>
+
+
 
 <p align="center">
   <a href="https://github.com/rustfs/rustfs/blob/main/README.md">English</a> | 简体中文 |
@@ -46,7 +52,7 @@ RustFS 是一个基于 Rust 构建的高性能分布式对象存储系统。Rust
 | :--- | :--- | :--- | :--- |
 | **S3 核心功能** | ✅ 可用 |    **Bitrot (防数据腐烂)** | ✅ 可用 |
 | **上传 / 下载** | ✅ 可用 |     **单机模式** | ✅ 可用 |
-| **版本控制** | ✅ 可用 | **存储桶复制** | ⚠️ 部分可用 |
+| **版本控制** | ✅ 可用 | **存储桶复制** | ✅ 可用 |
 | **日志功能** | ✅ 可用 |  **生命周期管理** | 🚧 测试中 |
 | **事件通知** | ✅ 可用 |  **分布式模式** | 🚧 测试中 |
 | **K8s Helm Chart** | ✅ 可用 |  **OPA (策略引擎)** | 🚧 测试中 |
@@ -79,6 +85,15 @@ RustFS 是一个基于 Rust 构建的高性能分布式对象存储系统。Rust
 | **边缘与 IoT** | **强大的边缘支持**<br>非常适合安全、创新的边缘设备。 | **边缘支持较弱**<br>对于边缘网关来说通常过于沉重。 |
 | **成本** | **稳定且免费**<br>免费社区支持，稳定的商业定价。 | **高昂成本**<br>1PiB 的成本可能高达 250,000 美元。 |
 | **风险控制** | **企业级风险规避**<br>清晰的知识产权，商业使用安全无忧。 | **法律风险**<br>知识产权归属模糊及使用限制风险。 |
+
+
+## 保持领先
+
+在 GitHub 上为 RustFS 点赞，即可第一时间收到新版本发布通知。
+
+<img src="https://github.com/user-attachments/assets/7ee40bb4-3e46-4eac-b0d0-5fbeb85ff8f3" />
+
+
 
 ## 快速开始
 
@@ -200,11 +215,7 @@ RustFS 是一个社区驱动的项目，我们感谢所有的贡献。请查看 
 <img src="https://opencollective.com/rustfs/contributors.svg?width=890&limit=500&button=false" alt="Contributors" />
 </a>
 
-## Github Trending Top
 
-🚀 RustFS 深受全球开源爱好者和企业用户的喜爱，经常荣登 GitHub Trending 榜单。
-
-<a href="https://trendshift.io/repositories/14181" target="_blank"><img src="https://raw.githubusercontent.com/rustfs/rustfs/refs/heads/main/docs/rustfs-trending.jpg" alt="rustfs%2Frustfs | Trendshift" /></a>
 
 ## Star 历史
 

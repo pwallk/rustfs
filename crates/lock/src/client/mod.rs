@@ -13,7 +13,7 @@
 // limitations under the License.
 
 pub mod local;
-pub mod remote;
+// pub mod remote;
 
 use async_trait::async_trait;
 use std::sync::Arc;
@@ -74,25 +74,16 @@ impl ClientFactory {
         Arc::new(local::LocalClient::new())
     }
 
-    /// Create remote client
-    pub fn create_remote(endpoint: String) -> Arc<dyn LockClient> {
-        Arc::new(remote::RemoteClient::new(endpoint))
-    }
+    // /// Create remote client
+    // pub fn create_remote(endpoint: String) -> Arc<dyn LockClient> {
+    //     Arc::new(remote::RemoteClient::new(endpoint))
+    // }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::types::LockType;
-
-    #[tokio::test]
-    async fn test_client_factory() {
-        let local_client = ClientFactory::create_local();
-        assert!(local_client.is_local().await);
-
-        let remote_client = ClientFactory::create_remote("http://localhost:8080".to_string());
-        assert!(!remote_client.is_local().await);
-    }
 
     #[tokio::test]
     async fn test_local_client_basic_operations() {
@@ -104,20 +95,20 @@ mod tests {
         let response = client.acquire_exclusive(&request).await;
         assert!(response.is_ok());
 
-        if let Ok(response) = response {
-            if response.success {
-                let lock_info = response.lock_info.unwrap();
+        if let Ok(response) = response
+            && response.success
+        {
+            let lock_info = response.lock_info.unwrap();
 
-                // Test status check
-                let status = client.check_status(&lock_info.id).await;
-                assert!(status.is_ok());
-                assert!(status.unwrap().is_some());
+            // Test status check
+            let status = client.check_status(&lock_info.id).await;
+            assert!(status.is_ok());
+            assert!(status.unwrap().is_some());
 
-                // Test lock release
-                let released = client.release(&lock_info.id).await;
-                assert!(released.is_ok());
-                assert!(released.unwrap());
-            }
+            // Test lock release
+            let released = client.release(&lock_info.id).await;
+            assert!(released.is_ok());
+            assert!(released.unwrap());
         }
     }
 }

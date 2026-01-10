@@ -226,14 +226,19 @@ impl Default for CompressionConfig {
 /// - Only compresses responses that match configured file extensions OR MIME types
 /// - Respects minimum file size threshold
 /// - Always skips error responses (4xx, 5xx) to avoid Content-Length issues
-/// - Skips already encoded responses (Content-Encoding header present)
 ///
 /// # Design Philosophy
 /// Unlike the previous blacklist approach, this whitelist approach:
 /// 1. Only compresses explicitly configured content types
 /// 2. Preserves Content-Length for all other responses (better browser UX)
 /// 3. Aligns with MinIO's opt-in compression behavior
-/// 4. Avoids double compression by checking Content-Encoding header
+///
+/// # Note on tower-http Integration
+/// The `tower-http::CompressionLayer` automatically handles:
+/// - Skipping responses with `Content-Encoding` header (already compressed)
+/// - Skipping responses with `Content-Range` header (Range requests)
+///
+/// These checks are performed before calling this predicate, so we don't need to check them here.
 ///
 /// # Extension Matching
 /// File extension matching works by extracting the filename from the
@@ -273,55 +278,39 @@ impl Predicate for CompressionPredicate {
             return false;
         }
 
-        // Skip if content is already encoded (e.g., gzip, br, deflate, zstd)
-        // Re-compressing already compressed content provides no benefit and may cause issues
-        if let Some(content_encoding) = response.headers().get(http::header::CONTENT_ENCODING) {
-            if let Ok(encoding) = content_encoding.to_str() {
-                let encoding_lower = encoding.to_lowercase();
-                // Check for common compression encodings
-                // "identity" means no encoding, so we can still compress
-                if encoding_lower != "identity" && !encoding_lower.is_empty() {
-                    debug!("Skipping compression for already encoded response: Content-Encoding={}", encoding);
-                    return false;
-                }
-            }
-        }
+        // Note: CONTENT_ENCODING and CONTENT_RANGE checks are handled by tower-http's
+        // CompressionLayer before calling this predicate, so we don't need to check them here.
 
         // Check Content-Length header for minimum size threshold
-        if let Some(content_length) = response.headers().get(http::header::CONTENT_LENGTH) {
-            if let Ok(length_str) = content_length.to_str() {
-                if let Ok(length) = length_str.parse::<u64>() {
-                    if length < self.config.min_size {
-                        debug!(
-                            "Skipping compression for small response: size={} bytes, min_size={}",
-                            length, self.config.min_size
-                        );
-                        return false;
-                    }
-                }
-            }
+        if let Some(content_length) = response.headers().get(http::header::CONTENT_LENGTH)
+            && let Ok(length_str) = content_length.to_str()
+            && let Ok(length) = length_str.parse::<u64>()
+            && length < self.config.min_size
+        {
+            debug!(
+                "Skipping compression for small response: size={} bytes, min_size={}",
+                length, self.config.min_size
+            );
+            return false;
         }
 
         // Check if the response matches configured extension via Content-Disposition
-        if let Some(content_disposition) = response.headers().get(http::header::CONTENT_DISPOSITION) {
-            if let Ok(cd) = content_disposition.to_str() {
-                if let Some(filename) = CompressionConfig::extract_filename_from_content_disposition(cd) {
-                    if self.config.matches_extension(&filename) {
-                        debug!("Compressing response: filename '{}' matches configured extension", filename);
-                        return true;
-                    }
-                }
-            }
+        if let Some(content_disposition) = response.headers().get(http::header::CONTENT_DISPOSITION)
+            && let Ok(cd) = content_disposition.to_str()
+            && let Some(filename) = CompressionConfig::extract_filename_from_content_disposition(cd)
+            && self.config.matches_extension(&filename)
+        {
+            debug!("Compressing response: filename '{}' matches configured extension", filename);
+            return true;
         }
 
         // Check if the response matches configured MIME type
-        if let Some(content_type) = response.headers().get(http::header::CONTENT_TYPE) {
-            if let Ok(ct) = content_type.to_str() {
-                if self.config.matches_mime_type(ct) {
-                    debug!("Compressing response: Content-Type '{}' matches configured MIME pattern", ct);
-                    return true;
-                }
-            }
+        if let Some(content_type) = response.headers().get(http::header::CONTENT_TYPE)
+            && let Ok(ct) = content_type.to_str()
+            && self.config.matches_mime_type(ct)
+        {
+            debug!("Compressing response: Content-Type '{}' matches configured MIME pattern", ct);
+            return true;
         }
 
         // Default: don't compress (whitelist approach)

@@ -11,6 +11,11 @@
 </p>
 
 <p align="center">
+<a href="https://trendshift.io/repositories/14181" target="_blank"><img src="https://trendshift.io/api/badge/repositories/14181" alt="rustfs%2Frustfs | Trendshift" style="width: 250px; height: 55px;" width="250" height="55"/></a>
+</p>
+
+
+<p align="center">
   <a href="https://docs.rustfs.com/installation/">Getting Started</a>
   · <a href="https://docs.rustfs.com/">Docs</a>
   · <a href="https://github.com/rustfs/rustfs/issues">Bug reports</a>
@@ -45,10 +50,10 @@ Unlike other storage systems, RustFS is released under the permissible Apache 2.
 | :--- | :--- | :--- | :--- |
 | **S3 Core Features** | ✅ Available | **Bitrot Protection** | ✅ Available |
 | **Upload / Download** | ✅ Available | **Single Node Mode** | ✅ Available |
-| **Versioning** | ✅ Available |  **Bucket Replication** | ⚠️ Partial Support |
+| **Versioning** | ✅ Available |  **Bucket Replication** | ✅ Available |
 | **Logging** | ✅ Available |  **Lifecycle Management** | 🚧 Under Testing |
 | **Event Notifications** | ✅ Available |  **Distributed Mode** | 🚧 Under Testing |
-| **K8s Helm Charts** | ✅ Available |  **OPA (Open Policy Agent)** | 🚧 Under Testing |
+| **K8s Helm Charts** | ✅ Available |   **RustFS KMS** | 🚧 Under Testing | 
 
 
 
@@ -78,6 +83,13 @@ Unlike other storage systems, RustFS is released under the permissible Apache 2.
 | **Edge & IoT** | **Strong Edge Support**<br>Ideal for secure, innovative edge devices. | **Weak Edge Support**<br>Often too heavy for edge gateways. |
 | **Risk Profile** | **Enterprise Risk Mitigation**<br>Clear IP rights and safe for commercial use. | **Legal Risks**<br>Intellectual property ambiguity and usage restrictions. |
 
+
+## Staying ahead
+
+Star RustFS on GitHub and be instantly notified of new releases.
+
+<img src="https://github.com/user-attachments/assets/7ee40bb4-3e46-4eac-b0d0-5fbeb85ff8f3" />
+
 ## Quickstart
 
 To get started with RustFS, follow these steps:
@@ -103,7 +115,7 @@ The RustFS container runs as a non-root user `rustfs` (UID `10001`). If you run 
  docker run -d -p 9000:9000 -p 9001:9001 -v $(pwd)/data:/data -v $(pwd)/logs:/logs rustfs/rustfs:latest
 
  # Using specific version
- docker run -d -p 9000:9000 -p 9001:9001 -v $(pwd)/data:/data -v $(pwd)/logs:/logs rustfs/rustfs:1.0.0.alpha.68
+ docker run -d -p 9000:9000 -p 9001:9001 -v $(pwd)/data:/data -v $(pwd)/logs:/logs rustfs/rustfs:1.0.0-alpha.76
 ```
 
 You can also use Docker Compose. Using the `docker-compose.yml` file in the root directory:
@@ -174,7 +186,7 @@ nix run
 
 ### Accessing RustFS
 
-5.  **Access the Console**: Open your web browser and navigate to `http://localhost:9000` to access the RustFS console.
+5.  **Access the Console**: Open your web browser and navigate to `http://localhost:9001` to access the RustFS console.
       * Default credentials: `rustfsadmin` / `rustfsadmin`
 6.  **Create a Bucket**: Use the console to create a new bucket for your objects.
 7.  **Upload Objects**: You can upload files directly through the console or use S3-compatible APIs/clients to interact with your RustFS instance.
@@ -215,11 +227,6 @@ RustFS is a community-driven project, and we appreciate all contributions. Check
 <img src="https://opencollective.com/rustfs/contributors.svg?width=890&limit=500&button=false" alt="Contributors" />
 </a>
 
-## Github Trending Top
-
-🚀 RustFS is beloved by open-source enthusiasts and enterprise users worldwide, often appearing on the GitHub Trending top charts.
-
-<a href="https://trendshift.io/repositories/14181" target="_blank"><img src="https://raw.githubusercontent.com/rustfs/rustfs/refs/heads/main/docs/rustfs-trending.jpg" alt="rustfs%2Frustfs | Trendshift" /></a>
 
 ## Star History
 
