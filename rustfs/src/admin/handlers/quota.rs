@@ -415,13 +415,14 @@ impl Operation for CheckBucketQuotaHandler {
 
         let operation: QuotaOperation = match request.operation_type.to_uppercase().as_str() {
             "PUT" | "PUTOBJECT" => QuotaOperation::PutObject,
+            "POST" | "POSTOBJECT" => QuotaOperation::PostObject,
             "COPY" | "COPYOBJECT" => QuotaOperation::CopyObject,
             "DELETE" | "DELETEOBJECT" => QuotaOperation::DeleteObject,
             _ => QuotaOperation::PutObject, // Default to PUT operation
         };
 
         let result = quota_checker
-            .check_quota(&bucket, operation, request.operation_size)
+            .check_quota_with_usage_reporting(&bucket, operation, request.operation_size, true)
             .await
             .map_err(|e| s3_error!(InternalError, "Failed to check quota: {}", e))?;
 
@@ -430,7 +431,7 @@ impl Operation for CheckBucketQuotaHandler {
             operation_type: request.operation_type,
             operation_size: request.operation_size,
             allowed: result.allowed,
-            current_usage: result.current_usage,
+            current_usage: result.current_usage.unwrap_or(0),
             quota_limit: result.quota_limit,
             remaining_quota: result.remaining,
         };
@@ -455,6 +456,7 @@ mod tests {
     fn test_quota_operation_parsing() {
         let parse_operation = |operation: &str| match operation.to_uppercase().as_str() {
             "PUT" | "PUTOBJECT" => QuotaOperation::PutObject,
+            "POST" | "POSTOBJECT" => QuotaOperation::PostObject,
             "COPY" | "COPYOBJECT" => QuotaOperation::CopyObject,
             "DELETE" | "DELETEOBJECT" => QuotaOperation::DeleteObject,
             _ => QuotaOperation::PutObject,
@@ -463,6 +465,9 @@ mod tests {
         assert!(matches!(parse_operation("put"), QuotaOperation::PutObject));
         assert!(matches!(parse_operation("PUT"), QuotaOperation::PutObject));
         assert!(matches!(parse_operation("PutObject"), QuotaOperation::PutObject));
+        assert!(matches!(parse_operation("post"), QuotaOperation::PostObject));
+        assert!(matches!(parse_operation("POST"), QuotaOperation::PostObject));
+        assert!(matches!(parse_operation("PostObject"), QuotaOperation::PostObject));
         assert!(matches!(parse_operation("copy"), QuotaOperation::CopyObject));
         assert!(matches!(parse_operation("DELETE"), QuotaOperation::DeleteObject));
         assert!(matches!(parse_operation("unknown"), QuotaOperation::PutObject));
