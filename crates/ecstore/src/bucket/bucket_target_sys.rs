@@ -21,6 +21,7 @@ use crate::bucket::target::ARN;
 use crate::bucket::target::BucketTargetType;
 use crate::bucket::target::{self, BucketTarget, BucketTargets, Credentials};
 use crate::bucket::versioning_sys::BucketVersioningSys;
+use crate::global::get_global_bucket_monitor;
 use aws_credential_types::Credentials as SdkCredentials;
 use aws_sdk_s3::config::Region as SdkRegion;
 use aws_sdk_s3::error::ProvideErrorMetadata;
@@ -35,20 +36,25 @@ use aws_sdk_s3::types::{
 };
 use aws_sdk_s3::{Client as S3Client, Config as S3Config, operation::head_object::HeadObjectOutput};
 use aws_sdk_s3::{config::SharedCredentialsProvider, types::BucketVersioningStatus};
+use aws_smithy_http_client::{Builder as SmithyHttpClientBuilder, tls as smithy_tls};
 use http::{HeaderMap, HeaderName, HeaderValue, StatusCode};
 use reqwest::Client as HttpClient;
+use rustfs_config::{DEFAULT_TRUST_LEAF_CERT_AS_CA, ENV_TRUST_LEAF_CERT_AS_CA, RUSTFS_CA_CERT, RUSTFS_TLS_CERT};
 use rustfs_filemeta::{ReplicationStatusType, ReplicationType};
 use rustfs_utils::http::{
     AMZ_BUCKET_REPLICATION_STATUS, AMZ_OBJECT_LOCK_BYPASS_GOVERNANCE, AMZ_OBJECT_LOCK_LEGAL_HOLD, AMZ_OBJECT_LOCK_MODE,
-    AMZ_OBJECT_LOCK_RETAIN_UNTIL_DATE, AMZ_STORAGE_CLASS, AMZ_WEBSITE_REDIRECT_LOCATION, RUSTFS_BUCKET_REPLICATION_CHECK,
-    RUSTFS_BUCKET_REPLICATION_DELETE_MARKER, RUSTFS_BUCKET_REPLICATION_REQUEST, RUSTFS_BUCKET_SOURCE_ETAG,
-    RUSTFS_BUCKET_SOURCE_MTIME, RUSTFS_BUCKET_SOURCE_VERSION_ID, RUSTFS_FORCE_DELETE, is_amz_header, is_minio_header,
+    AMZ_OBJECT_LOCK_RETAIN_UNTIL_DATE, AMZ_STORAGE_CLASS, AMZ_WEBSITE_REDIRECT_LOCATION, is_amz_header, is_minio_header,
     is_rustfs_header, is_standard_header, is_storageclass_header,
+};
+use rustfs_utils::http::{
+    SUFFIX_FORCE_DELETE, SUFFIX_SOURCE_DELETEMARKER, SUFFIX_SOURCE_ETAG, SUFFIX_SOURCE_MTIME, SUFFIX_SOURCE_REPLICATION_CHECK,
+    SUFFIX_SOURCE_REPLICATION_REQUEST, SUFFIX_SOURCE_VERSION_ID, insert_header,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::error::Error;
 use std::fmt;
+use std::path::Path;
 use std::str::FromStr as _;
 use std::sync::Arc;
 use std::sync::OnceLock;
@@ -63,8 +69,6 @@ use uuid::Uuid;
 
 const DEFAULT_HEALTH_CHECK_DURATION: Duration = Duration::from_secs(5);
 const DEFAULT_HEALTH_CHECK_RELOAD_DURATION: Duration = Duration::from_secs(30 * 60);
-
-const REPLICATION_REQUEST_TRUE: HeaderValue = HeaderValue::from_static("true");
 
 pub static GLOBAL_BUCKET_TARGET_SYS: OnceLock<BucketTargetSys> = OnceLock::new();
 
@@ -639,12 +643,23 @@ impl BucketTargetSys {
             format!("http://{}", target.endpoint)
         };
 
-        let config = S3Config::builder()
+        let mut config_builder = S3Config::builder()
             .endpoint_url(endpoint.clone())
             .credentials_provider(SharedCredentialsProvider::new(creds))
             .region(SdkRegion::new(target.region.clone()))
-            .behavior_version(aws_sdk_s3::config::BehaviorVersion::latest())
-            .build();
+            .behavior_version(aws_sdk_s3::config::BehaviorVersion::latest());
+
+        if should_force_path_style(target) {
+            config_builder = config_builder.force_path_style(true);
+        }
+
+        if target.secure
+            && let Some(http_client) = build_aws_s3_http_client_from_tls_path().await
+        {
+            config_builder = config_builder.http_client(http_client);
+        }
+
+        let config = config_builder.build();
 
         Ok(TargetClient {
             endpoint,
@@ -667,9 +682,19 @@ impl BucketTargetSys {
         Ok(true)
     }
 
-    fn update_bandwidth_limit(&self, _bucket: &str, _arn: &str, _limit: i64) {
-        // Implementation for bandwidth limit update
-        // This would interact with the global bucket monitor
+    fn update_bandwidth_limit(&self, bucket: &str, arn: &str, limit: i64) {
+        if let Some(bucket_monitor) = get_global_bucket_monitor() {
+            if limit == 0 {
+                bucket_monitor.delete_bucket_throttle(bucket, arn);
+                return;
+            }
+            bucket_monitor.set_bandwidth_limit(bucket, arn, limit);
+        } else {
+            error!(
+                "Global bucket monitor uninitialized; skipping bandwidth limit update for bucket '{}' and ARN '{}'",
+                bucket, arn
+            );
+        }
     }
 
     pub async fn get_remote_target_client_by_arn(&self, _bucket: &str, arn: &str) -> Option<Arc<TargetClient>> {
@@ -691,6 +716,7 @@ impl BucketTargetSys {
         if let Some(existing_targets) = targets_map.remove(bucket) {
             for target in existing_targets {
                 arn_remotes_map.remove(&target.arn);
+                self.update_bandwidth_limit(bucket, &target.arn, 0);
             }
         }
 
@@ -774,6 +800,71 @@ impl BucketTargetSys {
         }
         let arn = generate_arn(target, depl_id);
         (arn, false)
+    }
+}
+
+async fn build_aws_s3_http_client_from_tls_path() -> Option<aws_sdk_s3::config::SharedHttpClient> {
+    let tls_path = rustfs_utils::get_env_str(rustfs_config::ENV_RUSTFS_TLS_PATH, rustfs_config::DEFAULT_RUSTFS_TLS_PATH);
+    if tls_path.is_empty() {
+        return None;
+    }
+
+    let tls_dir = Path::new(&tls_path);
+    let mut trust_store = smithy_tls::TrustStore::default();
+    let mut has_custom_certs = false;
+
+    let ca_path = tls_dir.join(RUSTFS_CA_CERT);
+    match tokio::fs::read(&ca_path).await {
+        Ok(pem) => {
+            trust_store.add_pem_certificate(pem);
+            has_custom_certs = true;
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => warn!("failed to read custom CA bundle {:?} for replication client: {}", ca_path, e),
+    }
+
+    if rustfs_utils::get_env_bool(ENV_TRUST_LEAF_CERT_AS_CA, DEFAULT_TRUST_LEAF_CERT_AS_CA) {
+        let leaf_cert_path = tls_dir.join(RUSTFS_TLS_CERT);
+        match tokio::fs::read(&leaf_cert_path).await {
+            Ok(pem) => {
+                trust_store.add_pem_certificate(pem);
+                has_custom_certs = true;
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => warn!("failed to read leaf cert {:?} for replication client trust store: {}", leaf_cert_path, e),
+        }
+    }
+
+    if !has_custom_certs {
+        return None;
+    }
+
+    let tls_context = match smithy_tls::TlsContext::builder().with_trust_store(trust_store).build() {
+        Ok(ctx) => ctx,
+        Err(e) => {
+            warn!("failed to build AWS SDK TLS context for replication client: {}", e);
+            return None;
+        }
+    };
+
+    Some(
+        SmithyHttpClientBuilder::new()
+            .tls_provider(smithy_tls::Provider::rustls(smithy_tls::rustls_provider::CryptoMode::AwsLc))
+            .tls_context(tls_context)
+            .build_https(),
+    )
+}
+
+fn should_force_path_style(target: &BucketTarget) -> bool {
+    match target.path.trim().to_ascii_lowercase().as_str() {
+        // Explicit DNS/virtual-hosted-style requested by user.
+        "dns" | "off" | "false" => false,
+        // Explicit path-style or legacy boolean-like values.
+        "path" | "on" | "true" => true,
+        // `auto` and empty are defaulted to path-style for custom S3-compatible endpoints.
+        "auto" | "" => true,
+        // Unknown values: prefer compatibility with S3-compatible services.
+        _ => true,
     }
 }
 
@@ -990,23 +1081,21 @@ impl PutObjectOptions {
         }
 
         if !self.internal.source_version_id.is_empty() {
-            header.insert(
-                RUSTFS_BUCKET_SOURCE_VERSION_ID,
-                HeaderValue::from_str(&self.internal.source_version_id).expect("err"),
-            );
+            insert_header(&mut header, SUFFIX_SOURCE_VERSION_ID, &self.internal.source_version_id);
         }
         if self.internal.source_etag.is_empty() {
-            header.insert(RUSTFS_BUCKET_SOURCE_ETAG, HeaderValue::from_str(&self.internal.source_etag).expect("err"));
+            insert_header(&mut header, SUFFIX_SOURCE_ETAG, &self.internal.source_etag);
         }
         if self.internal.source_mtime.unix_timestamp() != 0 {
-            header.insert(
-                RUSTFS_BUCKET_SOURCE_MTIME,
-                HeaderValue::from_str(&self.internal.source_mtime.format(&Rfc3339).unwrap_or_default()).expect("err"),
+            insert_header(
+                &mut header,
+                SUFFIX_SOURCE_MTIME,
+                self.internal.source_mtime.format(&Rfc3339).unwrap_or_default(),
             );
         }
 
         if self.internal.replication_request {
-            header.insert(RUSTFS_BUCKET_REPLICATION_REQUEST, REPLICATION_REQUEST_TRUE);
+            insert_header(&mut header, SUFFIX_SOURCE_REPLICATION_REQUEST, "true");
         }
 
         header
@@ -1175,10 +1264,8 @@ impl TargetClient {
         let builder = self.client.put_object();
 
         let version_id = opts.internal.source_version_id.clone();
-        if !version_id.is_empty()
-            && let Ok(header_value) = HeaderValue::from_str(&version_id)
-        {
-            headers.insert(RUSTFS_BUCKET_SOURCE_VERSION_ID, header_value);
+        if !version_id.is_empty() {
+            insert_header(&mut headers, SUFFIX_SOURCE_VERSION_ID, &version_id);
         }
 
         match builder
@@ -1212,13 +1299,11 @@ impl TargetClient {
     ) -> Result<String, S3ClientError> {
         let mut headers = HeaderMap::new();
         let version_id = opts.internal.source_version_id.clone();
-        if !version_id.is_empty()
-            && let Ok(header_value) = HeaderValue::from_str(&version_id)
-        {
-            headers.insert(RUSTFS_BUCKET_SOURCE_VERSION_ID, header_value);
+        if !version_id.is_empty() {
+            insert_header(&mut headers, SUFFIX_SOURCE_VERSION_ID, &version_id);
         }
         if opts.internal.replication_request {
-            headers.insert(RUSTFS_BUCKET_REPLICATION_REQUEST, REPLICATION_REQUEST_TRUE);
+            insert_header(&mut headers, SUFFIX_SOURCE_REPLICATION_REQUEST, "true");
         }
 
         match self
@@ -1327,21 +1412,18 @@ impl TargetClient {
     ) -> Result<(), S3ClientError> {
         let mut headers = HeaderMap::new();
         if opts.force_delete {
-            headers.insert(RUSTFS_FORCE_DELETE, "true".parse().unwrap());
+            insert_header(&mut headers, SUFFIX_FORCE_DELETE, "true");
         }
         if opts.governance_bypass {
             headers.insert(AMZ_OBJECT_LOCK_BYPASS_GOVERNANCE, "true".parse().unwrap());
         }
 
         if opts.replication_delete_marker {
-            headers.insert(RUSTFS_BUCKET_REPLICATION_DELETE_MARKER, "true".parse().unwrap());
+            insert_header(&mut headers, SUFFIX_SOURCE_DELETEMARKER, "true");
         }
 
         if let Some(t) = opts.replication_mtime {
-            headers.insert(
-                RUSTFS_BUCKET_SOURCE_MTIME,
-                t.format(&Rfc3339).unwrap_or_default().as_str().parse().unwrap(),
-            );
+            insert_header(&mut headers, SUFFIX_SOURCE_MTIME, t.format(&Rfc3339).unwrap_or_default());
         }
 
         if !opts.replication_status.is_empty() {
@@ -1349,10 +1431,10 @@ impl TargetClient {
         }
 
         if opts.replication_request {
-            headers.insert(RUSTFS_BUCKET_REPLICATION_REQUEST, "true".parse().unwrap());
+            insert_header(&mut headers, SUFFIX_SOURCE_REPLICATION_REQUEST, "true");
         }
         if opts.replication_validity_check {
-            headers.insert(RUSTFS_BUCKET_REPLICATION_CHECK, "true".parse().unwrap());
+            insert_header(&mut headers, SUFFIX_SOURCE_REPLICATION_CHECK, "true");
         }
 
         match self

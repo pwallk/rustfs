@@ -361,10 +361,6 @@ impl<T: Store> IamSys<T> {
             return Err(IamError::IAMActionNotAllowed);
         }
 
-        if opts.expiration.is_none() {
-            return Err(IamError::InvalidExpiration);
-        }
-
         // TODO: check allow_site_replicator_account
 
         let policy_buf = if let Some(policy) = opts.session_policy {
@@ -619,6 +615,7 @@ impl<T: Store> IamSys<T> {
         }
 
         let updated_at = self.store.add_user(access_key, args).await?;
+        self.load_user(access_key, UserType::Reg).await?;
 
         self.notify_for_user(access_key, false).await;
 
@@ -746,22 +743,66 @@ impl<T: Store> IamSys<T> {
     pub async fn is_allowed_sts(&self, args: &Args<'_>, parent_user: &str) -> bool {
         let is_owner = matches!(get_global_action_cred(), Some(cred) if cred.access_key == parent_user);
         let role_arn = args.get_role_arn();
-        let policies = {
-            if is_owner {
-                Vec::new()
-            } else if role_arn.is_some() {
-                let Ok(arn) = ARN::parse(role_arn.unwrap_or_default()) else { return false };
 
-                MappedPolicy::new(self.roles_map.get(&arn).map_or_else(String::default, |v| v.clone()).as_str()).to_slice()
-            } else {
-                let Ok(p) = self.policy_db_get(parent_user, args.groups).await else { return false };
-
-                p
-                //TODO: FROM JWT
-            }
+        let (effective_groups, groups_source, policies) = if is_owner {
+            (None, "owner", Vec::new())
+        } else if let Some(arn_str) = role_arn {
+            let Ok(arn) = ARN::parse(arn_str) else { return false };
+            let p = MappedPolicy::new(self.roles_map.get(&arn).map_or_else(String::default, |v| v.clone()).as_str()).to_slice();
+            (None, "role", p)
+        } else {
+            let (effective_groups, groups_source) = match args.groups.as_ref() {
+                Some(g) if !g.is_empty() => (args.groups.clone(), "args"),
+                _ => match self.store.get_user(parent_user).await {
+                    Some(u) => (u.credentials.groups.clone(), "parent_user_credentials"),
+                    None => {
+                        tracing::warn!(
+                            parent_user = %parent_user,
+                            "is_allowed_sts: groups fallback failed — parent user not found; policy evaluation will use no groups"
+                        );
+                        (None, "parent_user_credentials")
+                    }
+                },
+            };
+            let p = self.policy_db_get(parent_user, &effective_groups).await.unwrap_or_default();
+            (effective_groups, groups_source, p)
         };
 
         if !is_owner && policies.is_empty() {
+            // For OIDC/STS users, policies may be specified in JWT claims rather than IAM DB.
+            // Resolve claim-based policy names against built-in default policies.
+            if let Some(claim_policies) = args.claims.get("policy").and_then(|v| v.as_str()) {
+                use rustfs_policy::policy::default::DEFAULT_POLICIES;
+                let mut resolved = Vec::new();
+                for policy_name in claim_policies.split(',').map(|s| s.trim()).filter(|s| !s.is_empty()) {
+                    if !Self::is_safe_claim_policy_name(policy_name) {
+                        continue;
+                    }
+                    for (name, p) in DEFAULT_POLICIES.iter() {
+                        if *name == policy_name {
+                            resolved.push(p.clone());
+                            break;
+                        }
+                    }
+                }
+                if !resolved.is_empty() {
+                    let combined = Policy::merge_policies(resolved);
+                    let (has_session_policy, is_allowed_sp) = is_allowed_by_session_policy(args);
+                    if has_session_policy {
+                        return is_allowed_sp && combined.is_allowed(args).await;
+                    }
+                    return combined.is_allowed(args).await;
+                }
+            }
+
+            if args.deny_only {
+                let combined_policy = Policy::default();
+                let (has_session_policy, is_allowed_sp) = is_allowed_by_session_policy(args);
+                if has_session_policy {
+                    return is_allowed_sp && combined_policy.is_allowed(args).await;
+                }
+                return combined_policy.is_allowed(args).await;
+            }
             return false;
         }
 
@@ -771,18 +812,37 @@ impl<T: Store> IamSys<T> {
             } else {
                 let (a, c) = self.store.merge_policies(&policies.join(",")).await;
                 if a.is_empty() {
-                    return false;
+                    if args.deny_only {
+                        Policy::default()
+                    } else {
+                        return false;
+                    }
+                } else {
+                    c
                 }
-                c
             }
         };
 
         let (has_session_policy, is_allowed_sp) = is_allowed_by_session_policy(args);
+        tracing::debug!(
+            "is_allowed_sts: action={:?}, has_session_policy={}, is_allowed_sp={}, is_owner={}, parent_user={}, groups_source={}, effective_groups={:?}",
+            args.action,
+            has_session_policy,
+            is_allowed_sp,
+            is_owner,
+            parent_user,
+            groups_source,
+            effective_groups
+        );
         if has_session_policy {
             return is_allowed_sp && (is_owner || combined_policy.is_allowed(args).await);
         }
 
         is_owner || combined_policy.is_allowed(args).await
+    }
+
+    fn is_safe_claim_policy_name(policy: &str) -> bool {
+        !policy.is_empty() && policy.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
     }
 
     pub async fn is_allowed_service_account(&self, args: &Args<'_>, parent_user: &str) -> bool {
@@ -977,4 +1037,379 @@ pub fn get_claims_from_token_with_secret(token: &str, secret: &str) -> Result<Ha
         );
     }
     Ok(ms.claims)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::cache::{Cache, CacheEntity};
+    use crate::error::Error;
+    use crate::manager::get_default_policyes;
+    use crate::store::{GroupInfo, MappedPolicy, Store, UserType};
+    use rustfs_credentials::Credentials;
+    use rustfs_policy::auth::UserIdentity;
+    use rustfs_policy::policy::Args;
+    use rustfs_policy::policy::action::{Action, AdminAction, S3Action};
+    use serde_json::Value;
+    use std::collections::HashMap;
+    use time::OffsetDateTime;
+
+    /// Mock Store for STS tests: either group-attached policies via parent user, or no IAM policies.
+    #[derive(Clone)]
+    struct StsTestMockStore {
+        /// When true, parent user has no groups and no mapped policies (empty `policy_db_get`).
+        empty_policies: bool,
+    }
+
+    #[async_trait::async_trait]
+    impl Store for StsTestMockStore {
+        fn has_watcher(&self) -> bool {
+            false
+        }
+
+        async fn save_iam_config<Item: serde::Serialize + Send>(&self, _item: Item, _path: impl AsRef<str> + Send) -> Result<()> {
+            Ok(())
+        }
+
+        async fn load_iam_config<Item: serde::de::DeserializeOwned>(&self, _path: impl AsRef<str> + Send) -> Result<Item> {
+            Err(Error::ConfigNotFound)
+        }
+
+        async fn delete_iam_config(&self, _path: impl AsRef<str> + Send) -> Result<()> {
+            Err(Error::InvalidArgument)
+        }
+
+        async fn save_user_identity(
+            &self,
+            _name: &str,
+            _user_type: UserType,
+            _item: UserIdentity,
+            _ttl: Option<usize>,
+        ) -> Result<()> {
+            Err(Error::InvalidArgument)
+        }
+
+        async fn delete_user_identity(&self, _name: &str, _user_type: UserType) -> Result<()> {
+            Err(Error::InvalidArgument)
+        }
+
+        async fn load_user_identity(&self, _name: &str, _user_type: UserType) -> Result<UserIdentity> {
+            Err(Error::InvalidArgument)
+        }
+
+        async fn load_user(&self, name: &str, user_type: UserType, m: &mut HashMap<String, UserIdentity>) -> Result<()> {
+            if user_type == UserType::Reg && name == "notify-user" {
+                let user = UserIdentity::from(Credentials {
+                    access_key: name.to_string(),
+                    secret_key: "notify-user-secret".to_string(),
+                    status: ACCOUNT_ON.to_string(),
+                    ..Default::default()
+                });
+                m.insert(name.to_string(), user);
+            }
+            Ok(())
+        }
+
+        async fn load_users(&self, _user_type: UserType, _m: &mut HashMap<String, UserIdentity>) -> Result<()> {
+            Ok(())
+        }
+
+        async fn load_secret_key(&self, _name: &str, _user_type: UserType) -> Result<String> {
+            Err(Error::InvalidArgument)
+        }
+
+        async fn save_group_info(&self, _name: &str, _item: GroupInfo) -> Result<()> {
+            Err(Error::InvalidArgument)
+        }
+
+        async fn delete_group_info(&self, _name: &str) -> Result<()> {
+            Err(Error::InvalidArgument)
+        }
+
+        async fn load_group(&self, _name: &str, _m: &mut HashMap<String, GroupInfo>) -> Result<()> {
+            Err(Error::InvalidArgument)
+        }
+
+        async fn load_groups(&self, _m: &mut HashMap<String, GroupInfo>) -> Result<()> {
+            Err(Error::InvalidArgument)
+        }
+
+        async fn save_policy_doc(&self, _name: &str, _item: rustfs_policy::policy::PolicyDoc) -> Result<()> {
+            Err(Error::InvalidArgument)
+        }
+
+        async fn delete_policy_doc(&self, _name: &str) -> Result<()> {
+            Err(Error::InvalidArgument)
+        }
+
+        async fn load_policy(&self, _name: &str) -> Result<rustfs_policy::policy::PolicyDoc> {
+            Err(Error::InvalidArgument)
+        }
+
+        async fn load_policy_doc(&self, _name: &str, _m: &mut HashMap<String, rustfs_policy::policy::PolicyDoc>) -> Result<()> {
+            Err(Error::InvalidArgument)
+        }
+
+        async fn load_policy_docs(&self, _m: &mut HashMap<String, rustfs_policy::policy::PolicyDoc>) -> Result<()> {
+            Err(Error::InvalidArgument)
+        }
+
+        async fn save_mapped_policy(
+            &self,
+            _name: &str,
+            _user_type: UserType,
+            _is_group: bool,
+            _item: MappedPolicy,
+            _ttl: Option<usize>,
+        ) -> Result<()> {
+            Err(Error::InvalidArgument)
+        }
+
+        async fn delete_mapped_policy(&self, _name: &str, _user_type: UserType, _is_group: bool) -> Result<()> {
+            Err(Error::InvalidArgument)
+        }
+
+        async fn load_mapped_policy(
+            &self,
+            name: &str,
+            user_type: UserType,
+            is_group: bool,
+            m: &mut HashMap<String, MappedPolicy>,
+        ) -> Result<()> {
+            if user_type == UserType::Reg && !is_group && name == "notify-user" {
+                m.insert(name.to_string(), MappedPolicy::new("readwrite"));
+            }
+            Ok(())
+        }
+
+        async fn load_mapped_policies(
+            &self,
+            _user_type: UserType,
+            _is_group: bool,
+            _m: &mut HashMap<String, MappedPolicy>,
+        ) -> Result<()> {
+            Ok(())
+        }
+
+        async fn load_all(&self, cache: &Cache) -> Result<()> {
+            let policy_docs = get_default_policyes();
+            cache
+                .policy_docs
+                .store(Arc::new(CacheEntity::new(policy_docs).update_load_time()));
+
+            if self.empty_policies {
+                const PARENT_USER: &str = "sts-empty-parent-policy-test";
+                let creds = Credentials {
+                    access_key: PARENT_USER.to_string(),
+                    secret_key: "longenoughsecret".to_string(),
+                    session_token: String::new(),
+                    expiration: None,
+                    status: "on".to_string(),
+                    parent_user: String::new(),
+                    groups: None,
+                    claims: None,
+                    name: None,
+                    description: None,
+                };
+                let parent_identity = UserIdentity {
+                    version: 1,
+                    credentials: creds,
+                    update_at: Some(OffsetDateTime::now_utc()),
+                };
+                let mut users = HashMap::new();
+                users.insert(PARENT_USER.to_string(), parent_identity);
+                cache.users.store(Arc::new(CacheEntity::new(users).update_load_time()));
+
+                cache.groups.store(Arc::new(CacheEntity::default().update_load_time()));
+                cache
+                    .group_policies
+                    .store(Arc::new(CacheEntity::default().update_load_time()));
+                cache.user_policies.store(Arc::new(CacheEntity::default().update_load_time()));
+                cache.sts_accounts.store(Arc::new(CacheEntity::default().update_load_time()));
+                cache.sts_policies.store(Arc::new(CacheEntity::default().update_load_time()));
+                cache.build_user_group_memberships();
+                return Ok(());
+            }
+
+            const PARENT_USER: &str = "sts-fallback-test-parent";
+            const GROUP_NAME: &str = "testgroup";
+
+            let creds = Credentials {
+                access_key: PARENT_USER.to_string(),
+                secret_key: "longenoughsecret".to_string(),
+                session_token: String::new(),
+                expiration: None,
+                status: "on".to_string(),
+                parent_user: String::new(),
+                groups: Some(vec![GROUP_NAME.to_string()]),
+                claims: None,
+                name: None,
+                description: None,
+            };
+            let parent_identity = UserIdentity {
+                version: 1,
+                credentials: creds,
+                update_at: Some(OffsetDateTime::now_utc()),
+            };
+            let mut users = HashMap::new();
+            users.insert(PARENT_USER.to_string(), parent_identity);
+            cache.users.store(Arc::new(CacheEntity::new(users).update_load_time()));
+
+            let group = GroupInfo::new(vec![PARENT_USER.to_string()]);
+            let mut groups = HashMap::new();
+            groups.insert(GROUP_NAME.to_string(), group);
+            cache.groups.store(Arc::new(CacheEntity::new(groups).update_load_time()));
+
+            let group_policy = MappedPolicy::new("readwrite");
+            let mut group_policies = HashMap::new();
+            group_policies.insert(GROUP_NAME.to_string(), group_policy);
+            cache
+                .group_policies
+                .store(Arc::new(CacheEntity::new(group_policies).update_load_time()));
+
+            cache.user_policies.store(Arc::new(CacheEntity::default().update_load_time()));
+            cache.sts_accounts.store(Arc::new(CacheEntity::default().update_load_time()));
+            cache.sts_policies.store(Arc::new(CacheEntity::default().update_load_time()));
+            cache.build_user_group_memberships();
+
+            Ok(())
+        }
+    }
+
+    /// Regression test: temp credentials without groups in args still receive group-attached
+    /// policies via the parent user (groups fallback). Without the fallback, policy_db_get
+    /// would get None for groups and the user would have no group policies, so the action
+    /// would be denied.
+    #[tokio::test]
+    async fn test_sts_groups_fallback_temp_creds_receive_parent_group_policies() {
+        let store = StsTestMockStore { empty_policies: false };
+        let cache_manager = IamCache::new(store).await;
+        let iam_sys = IamSys::new(cache_manager);
+
+        let parent_user = "sts-fallback-test-parent";
+        let claims = HashMap::new();
+        let groups: Option<Vec<String>> = None;
+        let args = Args {
+            account: parent_user,
+            groups: &groups,
+            action: Action::S3Action(S3Action::ListBucketAction),
+            bucket: "mybucket",
+            conditions: &HashMap::new(),
+            is_owner: false,
+            object: "",
+            claims: &claims,
+            deny_only: false,
+        };
+
+        let allowed = iam_sys.is_allowed_sts(&args, parent_user).await;
+        assert!(
+            allowed,
+            "STS temp credentials with no groups in args should still be allowed via parent user's group policy (readwrite)"
+        );
+    }
+
+    /// Regression: `deny_only` with empty IAM policies must still evaluate `sessionPolicy-extracted`
+    /// so session policy Deny cannot be bypassed (see PR #2250 review).
+    #[tokio::test]
+    async fn test_sts_deny_only_session_policy_deny_blocks_when_iam_policies_empty() {
+        let store = StsTestMockStore { empty_policies: true };
+        let cache_manager = IamCache::new(store).await;
+        let iam_sys = IamSys::new(cache_manager);
+
+        let parent_user = "sts-empty-parent-policy-test";
+        let session_policy_json = r#"{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Effect": "Deny",
+      "Action": ["admin:CreateUser"],
+      "Resource": ["arn:aws:s3:::*"]
+    }
+  ]
+}"#;
+        let mut claims = HashMap::new();
+        claims.insert(SESSION_POLICY_NAME_EXTRACTED.to_string(), Value::String(session_policy_json.to_string()));
+        let groups: Option<Vec<String>> = None;
+        let args = Args {
+            account: parent_user,
+            groups: &groups,
+            action: Action::AdminAction(AdminAction::CreateUserAdminAction),
+            bucket: "",
+            conditions: &HashMap::new(),
+            is_owner: false,
+            object: "",
+            claims: &claims,
+            deny_only: true,
+        };
+
+        let allowed = iam_sys.is_allowed_sts(&args, parent_user).await;
+        assert!(
+            !allowed,
+            "session policy Deny must be evaluated even when IAM policies are empty and deny_only is set"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_sts_deny_only_session_policy_allow_when_no_deny_on_action() {
+        let store = StsTestMockStore { empty_policies: true };
+        let cache_manager = IamCache::new(store).await;
+        let iam_sys = IamSys::new(cache_manager);
+
+        let parent_user = "sts-empty-parent-policy-test";
+        let session_policy_json = r#"{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Effect": "Allow",
+      "Action": ["s3:GetObject"],
+      "Resource": ["arn:aws:s3:::bucket/*"]
+    }
+  ]
+}"#;
+        let mut claims = HashMap::new();
+        claims.insert(SESSION_POLICY_NAME_EXTRACTED.to_string(), Value::String(session_policy_json.to_string()));
+        let groups: Option<Vec<String>> = None;
+        let args = Args {
+            account: parent_user,
+            groups: &groups,
+            action: Action::AdminAction(AdminAction::CreateUserAdminAction),
+            bucket: "",
+            conditions: &HashMap::new(),
+            is_owner: false,
+            object: "",
+            claims: &claims,
+            deny_only: true,
+        };
+
+        let allowed = iam_sys.is_allowed_sts(&args, parent_user).await;
+        assert!(
+            allowed,
+            "deny_only with no matching Deny in session policy should still allow self-service-style checks"
+        );
+    }
+
+    /// Regression test for cross-node IAM notifications:
+    /// `load_user` must populate user cache, and regular-user mapped policy must be written to
+    /// `user_policies` (not `sts_policies`), otherwise list-users and bucket-scoped user listing
+    /// may miss users on follower nodes.
+    #[tokio::test]
+    async fn test_load_user_notification_populates_user_and_policy_caches() {
+        let store = StsTestMockStore { empty_policies: false };
+        let cache_manager = IamCache::new(store).await;
+        let iam_sys = IamSys::new(cache_manager);
+
+        iam_sys.load_user("notify-user", UserType::Reg).await.unwrap();
+
+        let users = iam_sys.list_users().await.unwrap();
+        assert!(
+            users.contains_key("notify-user"),
+            "regular user loaded via notification must appear in list_users cache view"
+        );
+
+        let bucket_users = iam_sys.list_bucket_users("notification-regression-bucket").await.unwrap();
+        assert!(
+            bucket_users.contains_key("notify-user"),
+            "regular user mapped policy must be written to user_policies for bucket user listing"
+        );
+    }
 }

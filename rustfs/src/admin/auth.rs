@@ -17,12 +17,20 @@ use http::HeaderMap;
 use rustfs_credentials::Credentials;
 use rustfs_iam::store::object::ObjectStore;
 use rustfs_iam::sys::IamSys;
-use rustfs_policy::policy::Args;
-use rustfs_policy::policy::action::Action;
-use s3s::S3Result;
-use s3s::s3_error;
+use rustfs_policy::policy::{Args, action::Action};
+use s3s::{S3Result, s3_error};
 use std::collections::HashMap;
 use std::sync::Arc;
+use tracing::debug;
+
+#[derive(Clone)]
+struct AuthContext<'a> {
+    headers: &'a HeaderMap,
+    cred: &'a Credentials,
+    is_owner: bool,
+    deny_only: bool,
+    remote_addr: Option<std::net::SocketAddr>,
+}
 
 pub async fn validate_admin_request(
     headers: &HeaderMap,
@@ -35,45 +43,90 @@ pub async fn validate_admin_request(
     let Ok(iam_store) = rustfs_iam::get() else {
         return Err(s3_error!(InternalError, "iam not init"));
     };
-    for action in actions {
-        match check_admin_request_auth(iam_store.clone(), headers, cred, is_owner, deny_only, action, remote_addr).await {
-            Ok(_) => return Ok(()),
-            Err(_) => {
-                continue;
-            }
+    let ctx = AuthContext {
+        headers,
+        cred,
+        is_owner,
+        deny_only,
+        remote_addr,
+    };
+
+    for action in &actions {
+        if check_admin_request_auth(iam_store.clone(), &ctx, *action, "", "")
+            .await
+            .is_ok()
+        {
+            return Ok(());
         }
     }
-
     Err(s3_error!(AccessDenied, "Access Denied"))
 }
 
 async fn check_admin_request_auth(
     iam_store: Arc<IamSys<ObjectStore>>,
-    headers: &HeaderMap,
-    cred: &Credentials,
-    is_owner: bool,
-    deny_only: bool,
+    ctx: &AuthContext<'_>,
     action: Action,
-    remote_addr: Option<std::net::SocketAddr>,
+    bucket: &str,
+    object: &str,
 ) -> S3Result<()> {
-    let conditions = get_condition_values(headers, cred, None, None, remote_addr);
+    let conditions = get_condition_values(ctx.headers, ctx.cred, None, None, ctx.remote_addr);
 
-    if !iam_store
+    let allowed = iam_store
         .is_allowed(&Args {
-            account: &cred.access_key,
-            groups: &cred.groups,
+            account: &ctx.cred.access_key,
+            groups: &ctx.cred.groups,
             action,
             conditions: &conditions,
-            is_owner,
-            claims: cred.claims.as_ref().unwrap_or(&HashMap::new()),
-            deny_only,
-            bucket: "",
-            object: "",
+            is_owner: ctx.is_owner,
+            claims: ctx.cred.claims.as_ref().unwrap_or(&HashMap::new()),
+            deny_only: ctx.deny_only,
+            bucket,
+            object,
         })
-        .await
-    {
+        .await;
+
+    if !allowed {
+        debug!(
+            target = "rustfs::admin::auth",
+            ?action,
+            deny_only = ctx.deny_only,
+            is_owner = ctx.is_owner,
+            signer_access_key = %ctx.cred.access_key,
+            "IAM is_allowed returned false for admin request (enable DEBUG for rustfs::admin::auth)"
+        );
         return Err(s3_error!(AccessDenied, "Access Denied"));
     }
 
     Ok(())
+}
+
+pub async fn validate_admin_request_with_bucket(
+    headers: &HeaderMap,
+    cred: &Credentials,
+    is_owner: bool,
+    deny_only: bool,
+    actions: Vec<Action>,
+    remote_addr: Option<std::net::SocketAddr>,
+    bucket: &str,
+) -> S3Result<()> {
+    let Ok(iam_store) = rustfs_iam::get() else {
+        return Err(s3_error!(InternalError, "iam not init"));
+    };
+    let ctx = AuthContext {
+        headers,
+        cred,
+        is_owner,
+        deny_only,
+        remote_addr,
+    };
+
+    for action in &actions {
+        if check_admin_request_auth(iam_store.clone(), &ctx, *action, bucket, "")
+            .await
+            .is_ok()
+        {
+            return Ok(());
+        }
+    }
+    Err(s3_error!(AccessDenied, "Access Denied"))
 }

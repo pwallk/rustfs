@@ -16,7 +16,7 @@ use super::rules_map::RulesMap;
 use super::xml_config::ParseConfigError as BucketNotificationConfigError;
 use crate::rules::NotificationConfiguration;
 use crate::rules::subscriber_snapshot::{BucketRulesSnapshot, DynRulesContainer, RuleEvents, RulesContainer};
-use rustfs_targets::EventName;
+use rustfs_s3_common::EventName;
 use rustfs_targets::arn::TargetID;
 use serde::{Deserialize, Serialize};
 use std::io::Read;
@@ -117,7 +117,7 @@ impl BucketNotificationConfig {
             // The ARN in queue_conf should now have its region set if it was originally empty.
             // Ensure TargetID can be cloned or extracted correctly.
             let target_id = queue_conf.arn.target_id.clone();
-            let pattern_str = queue_conf.filter.filter_rule_list.pattern();
+            let pattern_str = queue_conf.filter.pattern();
             rules_map.add_rule_config(&queue_conf.events, pattern_str, target_id);
         }
 

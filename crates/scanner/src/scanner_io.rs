@@ -13,6 +13,7 @@
 // limitations under the License.
 
 use crate::scanner_folder::{ScannerItem, scan_data_folder};
+use crate::sleeper::SCANNER_SLEEPER;
 use crate::{
     DATA_USAGE_CACHE_NAME, DATA_USAGE_ROOT, DataUsageCache, DataUsageCacheInfo, DataUsageEntry, DataUsageEntryInfo,
     DataUsageInfo, SizeSummary, TierStats,
@@ -20,6 +21,7 @@ use crate::{
 use futures::future::join_all;
 use rand::seq::SliceRandom as _;
 use rustfs_common::heal_channel::HealScanMode;
+use rustfs_common::metrics::{Metric, Metrics, emit_scan_bucket_drive_complete};
 use rustfs_ecstore::bucket::bucket_target_sys::BucketTargetSys;
 use rustfs_ecstore::bucket::lifecycle::lifecycle::Lifecycle;
 use rustfs_ecstore::bucket::metadata_sys::{get_lifecycle_config, get_object_lock_config, get_replication_config};
@@ -33,7 +35,7 @@ use rustfs_ecstore::error::{Error, StorageError};
 use rustfs_ecstore::global::GLOBAL_TierConfigMgr;
 use rustfs_ecstore::new_object_layer_fn;
 use rustfs_ecstore::set_disk::SetDisks;
-use rustfs_ecstore::store_api::{BucketInfo, BucketOptions, ObjectInfo};
+use rustfs_ecstore::store_api::{BucketInfo, BucketOperations, BucketOptions, ObjectInfo};
 use rustfs_ecstore::{StorageAPI, error::Result, store::ECStore};
 use rustfs_filemeta::FileMeta;
 use rustfs_utils::path::{SLASH_SEPARATOR, path_join_buf};
@@ -85,6 +87,7 @@ pub trait ScannerIODisk: Send + Sync + Debug + 'static {
 
 #[async_trait::async_trait]
 impl ScannerIO for ECStore {
+    #[tracing::instrument(skip(self, updates))]
     async fn nsscanner(
         &self,
         ctx: CancellationToken,
@@ -159,7 +162,8 @@ impl ScannerIO for ECStore {
 
         let all_buckets_clone = all_buckets.iter().map(|b| b.name.clone()).collect::<Vec<String>>();
         tokio::spawn(async move {
-            let mut last_update = SystemTime::now();
+            let mut last_update = SystemTime::UNIX_EPOCH;
+            let mut has_sent_once = false;
 
             let mut ticker = tokio::time::interval(Duration::from_secs(30));
             loop {
@@ -176,17 +180,18 @@ impl ScannerIO for ECStore {
                         let mut all_merged = DataUsageCache::default();
                         for result in results.iter() {
                             if result.info.last_update.is_none() {
-                                return;
+                                continue;
                             }
                             all_merged.merge(result);
                         }
 
-                        if all_merged.root().is_some() && all_merged.info.last_update.unwrap() > last_update
-                           && let Err(e) = updates
-                                .send(all_merged.dui(&all_merged.info.name, &all_buckets_clone))
-                                .await {
+                        let merged_last_update = all_merged.info.last_update.unwrap_or(SystemTime::UNIX_EPOCH);
+                        if all_merged.root().is_some() && (!has_sent_once || merged_last_update > last_update) {
+                            let dui = all_merged.dui(&all_merged.info.name, &all_buckets_clone);
+                            if let Err(e) = updates.send(dui).await {
                                 error!("Failed to send data usage info: {}", e);
                             }
+                        }
                         break;
                     }
                     _ = ticker.tick() => {
@@ -194,18 +199,19 @@ impl ScannerIO for ECStore {
                         let mut all_merged = DataUsageCache::default();
                         for result in results.iter() {
                             if result.info.last_update.is_none() {
-                                return;
+                                continue;
                             }
                             all_merged.merge(result);
                         }
 
-                        if all_merged.root().is_some() && all_merged.info.last_update.unwrap() > last_update {
-                           if let Err(e) = updates
-                                .send(all_merged.dui(&all_merged.info.name, &all_buckets_clone))
-                                .await {
+                        let merged_last_update = all_merged.info.last_update.unwrap_or(SystemTime::UNIX_EPOCH);
+                        if all_merged.root().is_some() && (!has_sent_once || merged_last_update > last_update) {
+                            let dui = all_merged.dui(&all_merged.info.name, &all_buckets_clone);
+                            if let Err(e) = updates.send(dui).await {
                                 error!("Failed to send data usage info: {}", e);
                             }
-                            last_update = all_merged.info.last_update.unwrap();
+                            has_sent_once = true;
+                            last_update = merged_last_update;
                         }
                     }
                 }
@@ -222,6 +228,7 @@ impl ScannerIO for ECStore {
 
 #[async_trait::async_trait]
 impl ScannerIOCache for SetDisks {
+    #[tracing::instrument(skip(self, updates))]
     async fn nsscanner_cache(
         self: Arc<Self>,
         ctx: CancellationToken,
@@ -298,7 +305,7 @@ impl ScannerIOCache for SetDisks {
 
                        let cache = cache_mutex_clone.lock().await;
                        if cache.info.last_update == last_update {
-                           continue;
+                        continue;
                        }
 
                        if let Err(e) = cache.save(store_clone.clone(), DATA_USAGE_CACHE_NAME).await {
@@ -483,6 +490,8 @@ impl ScannerIOCache for SetDisks {
 #[async_trait::async_trait]
 impl ScannerIODisk for Disk {
     async fn get_size(&self, mut item: ScannerItem) -> Result<SizeSummary> {
+        let done_object = Metrics::time(Metric::ScanObject);
+
         if !item.path.ends_with(&format!("{SLASH_SEPARATOR}{STORAGE_FORMAT_FILE}")) {
             return Err(StorageError::other("skip file".to_string()));
         }
@@ -496,7 +505,7 @@ impl ScannerIODisk for Disk {
                     &item.object_path()
                 );
 
-                return Err(StorageError::other("skip file".to_string()));
+                return Err(StorageError::other("failed to read metadata".to_string()));
             }
         };
 
@@ -506,7 +515,7 @@ impl ScannerIODisk for Disk {
         let fivs = match meta.get_file_info_versions(item.bucket.as_str(), item.object_path().as_str(), false) {
             Ok(versions) => versions,
             Err(e) => {
-                error!("Failed to get file info versions: {}", e);
+                error!("Failed to get file info versions: {}/{}, err: {e}", item.bucket, item.object_path());
                 return Err(StorageError::other("skip file".to_string()));
             }
         };
@@ -554,10 +563,14 @@ impl ScannerIODisk for Disk {
         item.apply_actions(ecstore, object_infos, lock_config, &mut size_summary)
             .await;
 
+        done_object();
+
         // TODO: enqueueFreeVersion
 
         Ok(size_summary)
     }
+
+    #[tracing::instrument(skip(self, updates, cache))]
     async fn nsscanner_disk(
         &self,
         ctx: CancellationToken,
@@ -565,6 +578,10 @@ impl ScannerIODisk for Disk {
         updates: Option<mpsc::Sender<DataUsageEntry>>,
         scan_mode: HealScanMode,
     ) -> Result<DataUsageCache> {
+        let done_drive = Metrics::time(Metric::ScanBucketDrive);
+        let drive_start = std::time::Instant::now();
+        let bucket = cache.info.name.clone();
+        let disk_path = self.path().to_string_lossy().to_string();
         let _guard = self.start_scan();
 
         let mut cache = cache;
@@ -624,17 +641,19 @@ impl ScannerIODisk for Disk {
 
         let disks = disks_result.into_iter().flatten().collect::<Vec<Arc<Disk>>>();
 
-        // Create we_sleep function (always return false for now, can be enhanced later)
-        let we_sleep: Box<dyn Fn() -> bool + Send + Sync> = Box::new(|| false);
-
-        let result = scan_data_folder(ctx, disks, local_disk, cache, updates, scan_mode, we_sleep).await;
+        let result = scan_data_folder(ctx, disks, local_disk, cache, updates, scan_mode, SCANNER_SLEEPER.clone()).await;
 
         match result {
             Ok(mut data_usage_info) => {
+                done_drive();
+                emit_scan_bucket_drive_complete(true, &bucket, &disk_path, drive_start.elapsed());
                 data_usage_info.info.last_update = Some(SystemTime::now());
                 Ok(data_usage_info)
             }
-            Err(e) => Err(StorageError::other(format!("Failed to scan data folder: {e}"))),
+            Err(e) => {
+                emit_scan_bucket_drive_complete(false, &bucket, &disk_path, drive_start.elapsed());
+                Err(StorageError::other(format!("Failed to scan data folder: {e}")))
+            }
         }
     }
 }

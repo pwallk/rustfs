@@ -20,8 +20,8 @@ use crate::bucket::replication::ResyncStatusType;
 use crate::bucket::replication::replicate_delete;
 use crate::bucket::replication::replicate_object;
 use crate::bucket::replication::replication_resyncer::{
-    BucketReplicationResyncStatus, DeletedObjectReplicationInfo, ReplicationConfig, ReplicationResyncer,
-    get_heal_replicate_object_info,
+    BucketReplicationResyncStatus, DeletedObjectReplicationInfo, REPLICATION_DIR, RESYNC_FILE_NAME, ReplicationConfig,
+    ReplicationResyncer, decode_resync_file, get_heal_replicate_object_info,
 };
 use crate::bucket::replication::replication_state::ReplicationStats;
 use crate::config::com::read_config;
@@ -41,7 +41,7 @@ use rustfs_filemeta::VersionPurgeStatusType;
 use rustfs_filemeta::replication_statuses_map;
 use rustfs_filemeta::version_purge_statuses_map;
 use rustfs_filemeta::{REPLICATE_EXISTING, REPLICATE_HEAL, REPLICATE_HEAL_DELETE};
-use rustfs_utils::http::RESERVED_METADATA_PREFIX_LOWER;
+use rustfs_utils::http::{SUFFIX_REPLICATION_TIMESTAMP, get_str};
 use std::any::Any;
 use std::sync::Arc;
 use std::sync::atomic::AtomicI32;
@@ -56,8 +56,7 @@ use tokio::sync::mpsc::Sender;
 use tokio::task::JoinHandle;
 use tokio::time::Duration;
 use tokio_util::sync::CancellationToken;
-use tracing::info;
-use tracing::warn;
+use tracing::{info, instrument, warn};
 
 // Worker limits
 pub const WORKER_MAX_LIMIT: usize = 500;
@@ -796,6 +795,7 @@ impl<S: StorageAPI> ReplicationPool<S> {
     }
 
     /// Load bucket replication resync statuses into memory
+    #[instrument(skip(cancellation_token))]
     async fn load_resync(self: Arc<Self>, buckets: &[String], cancellation_token: CancellationToken) -> Result<(), EcstoreError> {
         // TODO: add leader_lock
         // Make sure only one node running resync on the cluster
@@ -861,16 +861,7 @@ async fn load_bucket_resync_metadata<S: StorageAPI>(
     bucket: &str,
     obj_api: Arc<S>,
 ) -> Result<BucketReplicationResyncStatus, EcstoreError> {
-    use std::convert::TryInto;
-
     let mut brs = BucketReplicationResyncStatus::new();
-
-    // Constants that would be defined elsewhere
-    const REPLICATION_DIR: &str = "replication";
-    const RESYNC_FILE_NAME: &str = "resync.bin";
-    const RESYNC_META_FORMAT: u16 = 1;
-    const RESYNC_META_VERSION: u16 = 1;
-    const RESYNC_META_VERSION_V1: u16 = 1;
 
     let resync_dir_path = format!("{BUCKET_META_PREFIX}/{bucket}/{REPLICATION_DIR}");
     let resync_file_path = format!("{resync_dir_path}/{RESYNC_FILE_NAME}");
@@ -886,27 +877,7 @@ async fn load_bucket_resync_metadata<S: StorageAPI>(
         return Ok(brs);
     }
 
-    if data.len() <= 4 {
-        return Err(EcstoreError::CorruptedFormat);
-    }
-
-    // Read resync meta header
-    let format = u16::from_le_bytes(data[0..2].try_into().unwrap());
-    if format != RESYNC_META_FORMAT {
-        return Err(EcstoreError::CorruptedFormat);
-    }
-
-    let version = u16::from_le_bytes(data[2..4].try_into().unwrap());
-    if version != RESYNC_META_VERSION {
-        return Err(EcstoreError::CorruptedFormat);
-    }
-
-    // Parse data
-    brs = BucketReplicationResyncStatus::unmarshal_msg(&data[4..])?;
-
-    if brs.version != RESYNC_META_VERSION_V1 {
-        return Err(EcstoreError::CorruptedFormat);
-    }
+    brs = decode_resync_file(&data)?;
 
     Ok(brs)
 }
@@ -977,13 +948,15 @@ pub async fn init_background_replication<S: StorageAPI>(storage: Arc<S>) {
     assert!(GLOBAL_REPLICATION_POOL.get().is_some());
 }
 
+pub fn get_global_replication_pool() -> Option<Arc<DynReplicationPool>> {
+    GLOBAL_REPLICATION_POOL.get().cloned()
+}
+
 pub async fn schedule_replication<S: StorageAPI>(oi: ObjectInfo, o: Arc<S>, dsc: ReplicateDecision, op_type: ReplicationType) {
     let tgt_statuses = replication_statuses_map(&oi.replication_status_internal.clone().unwrap_or_default());
     let purge_statuses = version_purge_statuses_map(&oi.version_purge_status_internal.clone().unwrap_or_default());
-    let tm = oi
-        .user_defined
-        .get(&format!("{}{}", RESERVED_METADATA_PREFIX_LOWER, "replication-timestamp"))
-        .map(|v| OffsetDateTime::parse(v, &Rfc3339).unwrap_or(OffsetDateTime::UNIX_EPOCH));
+    let tm = get_str(&oi.user_defined, SUFFIX_REPLICATION_TIMESTAMP)
+        .map(|v| OffsetDateTime::parse(&v, &Rfc3339).unwrap_or(OffsetDateTime::UNIX_EPOCH));
     let mut rstate = oi.replication_state();
     rstate.replicate_decision_str = dsc.to_string();
     let asz = oi.get_actual_size().unwrap_or_default();

@@ -12,17 +12,19 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-// Ensure the correct path for parse_license is imported
-use super::compress::{CompressionConfig, CompressionPredicate};
+// Import HTTP server components and compression configuration
 use crate::admin;
 use crate::auth::IAMAuth;
+use crate::auth_keystone;
 use crate::config;
 use crate::server::{
     ReadinessGateLayer, RemoteAddr, ServiceState, ServiceStateManager,
+    compress::{CompressionConfig, CompressionPredicate},
     hybrid::hybrid,
-    layer::{ConditionalCorsLayer, RedirectLayer},
+    layer::{AdminChunkedContentLengthCompatLayer, ConditionalCorsLayer, ObjectAttributesEtagFixLayer, RedirectLayer},
 };
 use crate::storage;
+use crate::storage::rpc::InternodeRpcService;
 use crate::storage::tonic_service::make_server;
 use bytes::Bytes;
 use http::{HeaderMap, Method, Request as HttpRequest, Response};
@@ -34,9 +36,13 @@ use hyper_util::{
 };
 use metrics::{counter, histogram};
 use opentelemetry::global;
+use opentelemetry::trace::TraceContextExt;
 use rustfs_common::GlobalReadiness;
 use rustfs_config::{RUSTFS_TLS_CERT, RUSTFS_TLS_KEY};
 use rustfs_ecstore::rpc::{TONIC_RPC_PREFIX, verify_rpc_signature};
+use rustfs_keystone::KeystoneAuthLayer;
+#[cfg(feature = "swift")]
+use rustfs_protocols::SwiftService;
 use rustfs_protos::proto_gen::node_service::node_service_server::NodeServiceServer;
 use rustfs_trusted_proxies::ClientInfo;
 use rustfs_utils::net::parse_and_resolve_address;
@@ -60,11 +66,11 @@ use tracing::{Span, debug, error, info, instrument, warn};
 use tracing_opentelemetry::OpenTelemetrySpanExt;
 
 pub async fn start_http_server(
-    opt: &config::Opt,
+    config: &config::Config,
     worker_state_manager: ServiceStateManager,
     readiness: Arc<GlobalReadiness>,
 ) -> Result<tokio::sync::broadcast::Sender<()>> {
-    let server_addr = parse_and_resolve_address(opt.address.as_str()).map_err(Error::other)?;
+    let server_addr = parse_and_resolve_address(config.address.as_str()).map_err(Error::other)?;
     let server_port = server_addr.port();
 
     // The listening address and port are obtained from the parameters
@@ -150,7 +156,7 @@ pub async fn start_http_server(
         TcpListener::from_std(socket.into())?
     };
 
-    let tls_acceptor = setup_tls_acceptor(opt.tls_path.as_deref().unwrap_or_default()).await?;
+    let tls_acceptor = setup_tls_acceptor(config.tls_path.as_deref().unwrap_or_default()).await?;
     let tls_enabled = tls_acceptor.is_some();
     let protocol = if tls_enabled { "https" } else { "http" };
     // Obtain the listener address
@@ -173,7 +179,7 @@ pub async fn start_http_server(
     let api_endpoints = format!("{protocol}://{local_ip_str}:{server_port}");
     let localhost_endpoint = format!("{protocol}://127.0.0.1:{server_port}");
     let now_time = jiff::Zoned::now().strftime("%Y-%m-%d %H:%M:%S").to_string();
-    if opt.console_enable {
+    if config.console_enable {
         admin::console::init_console_cfg(local_ip, server_port);
 
         info!(
@@ -185,16 +191,11 @@ pub async fn start_http_server(
             "Console WebUI (localhost): {protocol}://127.0.0.1:{server_port}/rustfs/console/index.html",
 
         );
-
-        println!("Console WebUI Start Time: {now_time}");
-        println!("Console WebUI available at: {protocol}://{local_ip_str}:{server_port}/rustfs/console/index.html");
-        println!("Console WebUI (localhost): {protocol}://127.0.0.1:{server_port}/rustfs/console/index.html");
     } else {
-        info!(target: "rustfs::main::startup","RustFS API: {api_endpoints}  {localhost_endpoint}");
-        println!("RustFS Http API: {api_endpoints}  {localhost_endpoint}");
-        println!("RustFS Start Time: {now_time}");
-        if rustfs_credentials::DEFAULT_ACCESS_KEY.eq(&opt.access_key)
-            && rustfs_credentials::DEFAULT_SECRET_KEY.eq(&opt.secret_key)
+        info!(target: "rustfs::main::startup", "RustFS API: {api_endpoints}  {localhost_endpoint}");
+        info!(target: "rustfs::main::startup", "RustFS Start Time: {now_time}");
+        if rustfs_credentials::DEFAULT_ACCESS_KEY.eq(&config.access_key)
+            && rustfs_credentials::DEFAULT_SECRET_KEY.eq(&config.secret_key)
         {
             warn!(
                 "Detected default credentials '{}:{}', we recommend that you change these values with 'RUSTFS_ACCESS_KEY' and 'RUSTFS_SECRET_KEY' environment variables",
@@ -212,20 +213,20 @@ pub async fn start_http_server(
         let store = storage::ecfs::FS::new();
         let mut b = S3ServiceBuilder::new(store.clone());
 
-        let access_key = opt.access_key.clone();
-        let secret_key = opt.secret_key.clone();
+        let access_key = config.access_key.clone();
+        let secret_key = config.secret_key.clone();
 
         b.set_auth(IAMAuth::new(access_key, secret_key));
         b.set_access(store.clone());
-        b.set_route(admin::make_admin_route(opt.console_enable)?);
+        b.set_route(admin::make_admin_route(config.console_enable)?);
 
         // Virtual-hosted-style requests are only set up for S3 API when server domains are configured and console is disabled
-        if !opt.server_domains.is_empty() && !opt.console_enable {
-            MultiDomain::new(&opt.server_domains).map_err(Error::other)?; // validate domains
+        if !config.server_domains.is_empty() && !config.console_enable {
+            MultiDomain::new(&config.server_domains).map_err(Error::other)?; // validate domains
 
             // add the default port number to the given server domains
             let mut domain_sets = std::collections::HashSet::new();
-            for domain in &opt.server_domains {
+            for domain in &config.server_domains {
                 domain_sets.insert(domain.to_string());
                 if let Some((host, _)) = domain.split_once(':') {
                     domain_sets.insert(format!("{host}:{server_port}"));
@@ -256,7 +257,7 @@ pub async fn start_http_server(
         debug!("HTTP response compression is disabled");
     }
 
-    let is_console = opt.console_enable;
+    let is_console = config.console_enable;
     tokio::spawn(async move {
         // Note: CORS layer is removed from global middleware stack
         // - S3 API CORS is handled by bucket-level CORS configuration in apply_cors_headers()
@@ -441,10 +442,7 @@ async fn setup_tls_acceptor(tls_path: &str) -> Result<Option<TlsAcceptor>> {
     }
     debug!("Found TLS directory, checking for certificates");
 
-    // Make sure to use a modern encryption suite
-    let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
     let mtls_verifier = rustfs_utils::build_webpki_client_verifier(tls_path)?;
-
     // 1. Attempt to load all certificates in the directory (multi-certificate support, for SNI)
     if let Ok(cert_key_pairs) = rustfs_utils::load_all_certs_from_directory(tls_path)
         && !cert_key_pairs.is_empty()
@@ -587,7 +585,17 @@ fn process_connection(
         // Build services inside each connected task to avoid passing complex service types across tasks,
         // It also ensures that each connection has an independent service instance.
         let rpc_service = NodeServiceServer::with_interceptor(make_server(), check_auth);
-        let service = hybrid(s3_service, rpc_service);
+
+        // Wrap S3 service with Swift service to handle Swift API requests
+        // Swift API is only available when compiled with the 'swift' feature
+        // When enabled, Swift routes are handled at /v1/AUTH_* paths by default
+        #[cfg(feature = "swift")]
+        let http_service = SwiftService::new(true, None, s3_service);
+        #[cfg(not(feature = "swift"))]
+        let http_service = s3_service;
+        let http_service = InternodeRpcService::new(http_service);
+
+        let service = hybrid(http_service, rpc_service);
 
         let remote_addr = match socket.peer_addr() {
             Ok(addr) => Some(RemoteAddr(addr)),
@@ -616,14 +624,22 @@ fn process_connection(
                 None
             })
             .layer(SetRequestIdLayer::x_request_id(MakeRequestUuid))
+            .layer(AdminChunkedContentLengthCompatLayer)
             .layer(CatchPanicLayer::new())
             // CRITICAL: Insert ReadinessGateLayer before business logic
             // This stops requests from hitting IAMAuth or Storage if they are not ready.
             .layer(ReadinessGateLayer::new(readiness))
+            // Add Keystone authentication middleware
+            // This validates X-Auth-Token headers and stores credentials in task-local storage
+            // Must be placed AFTER ReadinessGateLayer but BEFORE business logic
+            .layer({
+                let keystone_auth = auth_keystone::get_keystone_auth();
+                KeystoneAuthLayer::new(keystone_auth)
+            })
             .layer(
                 TraceLayer::new_for_http()
                     .make_span_with(|request: &HttpRequest<_>| {
-                        let trace_id = request
+                        let request_id = request
                             .headers()
                             .get(http::header::HeaderName::from_static("x-request-id"))
                             .and_then(|v| v.to_str().ok())
@@ -633,6 +649,18 @@ fn process_connection(
                             propagator.extract(&HeaderMapCarrier::new(request.headers()))
                         });
 
+                        // Log trace context extraction for debugging distributed tracing
+                        if parent_context.has_active_span() {
+                            let span_ref = parent_context.span();
+                            debug!(
+                                otel_trace_id = %span_ref.span_context().trace_id(),
+                                otel_parent_span_id = %span_ref.span_context().span_id(),
+                                sampled = span_ref.span_context().is_sampled(),
+                                "Extracted trace context from incoming request headers"
+                            );
+                        } else {
+                            debug!("No trace context found in request headers, will create root span");
+                        }
                         // Extract real client IP from trusted proxy middleware if available
                         let client_info = request.extensions().get::<ClientInfo>();
                         let real_ip = client_info
@@ -640,13 +668,16 @@ fn process_connection(
                             .unwrap_or_else(|| "unknown".to_string());
 
                         let span = tracing::info_span!("http-request",
-                            trace_id = %trace_id,
+                            request_id = %request_id,
                             status_code = tracing::field::Empty,
                             method = %request.method(),
                             real_ip = %real_ip,
                             uri = %request.uri(),
                             version = ?request.version(),
                         );
+                        if span.is_disabled() {
+                            return span;
+                        }
                         if let Err(e) = span.set_parent(parent_context) {
                             warn!("Failed to propagate tracing context: `{:?}`", e);
                         }
@@ -661,10 +692,7 @@ fn process_connection(
                     .on_request(|request: &HttpRequest<_>, span: &Span| {
                         let _enter = span.enter();
                         debug!("http started method: {}, url path: {}", request.method(), request.uri().path());
-                        let labels = [
-                            ("key_request_method", format!("{}", request.method())),
-                            ("key_request_uri_path", request.uri().path().to_owned().to_string()),
-                        ];
+                        let labels = [("key_request_method", request.method().to_string())];
                         counter!("rustfs.api.requests.total", &labels).increment(1);
                     })
                     .on_response(|response: &Response<_>, latency: Duration, span: &Span| {
@@ -692,6 +720,7 @@ fn process_connection(
             // Compress responses based on whitelist configuration
             // Only compresses when enabled and matches configured extensions/MIME types
             .layer(CompressionLayer::new().compress_when(CompressionPredicate::new(compression_config)))
+            .layer(ObjectAttributesEtagFixLayer)
             // Conditional CORS layer: only applies to S3 API requests (not Admin, not Console)
             // Admin has its own CORS handling in router.rs
             // Console has its own CORS layer in setup_console_middleware_stack()

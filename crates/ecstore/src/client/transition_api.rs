@@ -139,7 +139,11 @@ pub enum BucketLookupType {
 fn load_root_store_from_tls_path() -> Option<rustls::RootCertStore> {
     // Load the root certificate bundle from the path specified by the
     // RUSTFS_TLS_PATH environment variable.
-    let tp = std::env::var("RUSTFS_TLS_PATH").ok()?;
+    let tp = rustfs_utils::get_env_str(rustfs_config::ENV_RUSTFS_TLS_PATH, rustfs_config::DEFAULT_RUSTFS_TLS_PATH);
+    // If no TLS path is configured, do not fall back to a CA bundle in the current directory.
+    if tp.is_empty() {
+        return None;
+    }
     let ca = std::path::Path::new(&tp).join(rustfs_config::RUSTFS_CA_CERT);
     if !ca.exists() {
         return None;
@@ -155,20 +159,33 @@ fn load_root_store_from_tls_path() -> Option<rustls::RootCertStore> {
     Some(store)
 }
 
-impl TransitionClient {
-    pub async fn new(endpoint: &str, opts: Options, tier_type: &str) -> Result<TransitionClient, std::io::Error> {
-        let clnt = Self::private_new(endpoint, opts, tier_type).await?;
-
-        Ok(clnt)
+fn panic_payload_to_message(payload: Box<dyn std::any::Any + Send>) -> String {
+    if let Some(message) = payload.downcast_ref::<String>() {
+        return message.clone();
     }
 
-    async fn private_new(endpoint: &str, opts: Options, tier_type: &str) -> Result<TransitionClient, std::io::Error> {
-        let endpoint_url = get_endpoint_url(endpoint, opts.secure)?;
+    if let Some(message) = payload.downcast_ref::<&'static str>() {
+        return (*message).to_string();
+    }
 
-        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
-        let scheme = endpoint_url.scheme();
-        let client;
-        let tls = if let Some(store) = load_root_store_from_tls_path() {
+    "unknown panic payload".to_string()
+}
+
+fn with_rustls_init_guard<T, F>(build: F) -> Result<T, std::io::Error>
+where
+    F: FnOnce() -> Result<T, std::io::Error>,
+{
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(build)).unwrap_or_else(|payload| {
+        let panic_message = panic_payload_to_message(payload);
+        Err(std::io::Error::other(format!(
+            "failed to initialize rustls crypto provider: {panic_message}. Ensure exactly one rustls crypto provider feature is enabled (aws-lc-rs or ring), or install one with CryptoProvider::install_default()"
+        )))
+    })
+}
+
+fn build_tls_config() -> Result<rustls::ClientConfig, std::io::Error> {
+    with_rustls_init_guard(|| {
+        let config = if let Some(store) = load_root_store_from_tls_path() {
             rustls::ClientConfig::builder()
                 .with_root_certificates(store)
                 .with_no_client_auth()
@@ -176,20 +193,47 @@ impl TransitionClient {
             rustls::ClientConfig::builder().with_native_roots()?.with_no_client_auth()
         };
 
+        Ok(config)
+    })
+}
+
+impl TransitionClient {
+    pub async fn new(endpoint: &str, opts: Options, tier_type: &str) -> Result<TransitionClient, std::io::Error> {
+        let client = Self::private_new(endpoint, opts, tier_type).await?;
+
+        Ok(client)
+    }
+
+    async fn private_new(endpoint: &str, opts: Options, tier_type: &str) -> Result<TransitionClient, std::io::Error> {
+        if rustls::crypto::CryptoProvider::get_default().is_none() {
+            // No default provider is set yet; try to install aws-lc-rs.
+            // `install_default` can only fail if another thread races us and installs a provider
+            // between our check and this call, which is still safe to ignore.
+            if rustls::crypto::aws_lc_rs::default_provider().install_default().is_err() {
+                debug!("rustls crypto provider was installed concurrently, skipping aws-lc-rs install");
+            }
+        } else {
+            debug!("rustls crypto provider already installed, skipping aws-lc-rs install");
+        }
+
+        let endpoint_url = get_endpoint_url(endpoint, opts.secure)?;
+
+        let tls = build_tls_config()?;
+
         let https = hyper_rustls::HttpsConnectorBuilder::new()
             .with_tls_config(tls)
             .https_or_http()
             .enable_http1()
             .enable_http2()
             .build();
-        client = Client::builder(TokioExecutor::new()).build(https);
+        let http_client = Client::builder(TokioExecutor::new()).build(https);
 
-        let mut clnt = TransitionClient {
+        let mut client = TransitionClient {
             endpoint_url,
             creds_provider: Arc::new(Mutex::new(opts.creds)),
             override_signer_type: SignatureType::SignatureDefault,
             secure: opts.secure,
-            http_client: client,
+            http_client,
             bucket_loc_cache: Arc::new(Mutex::new(BucketLocationCache::new())),
             is_trace_enabled: Arc::new(Mutex::new(false)),
             trace_errors_only: Arc::new(Mutex::new(false)),
@@ -207,23 +251,23 @@ impl TransitionClient {
         };
 
         {
-            let mut md5_hasher = clnt.md5_hasher.lock().unwrap();
+            let mut md5_hasher = client.md5_hasher.lock().unwrap();
             if md5_hasher.is_none() {
                 *md5_hasher = Some(HashAlgorithm::Md5);
             }
         }
-        if clnt.sha256_hasher.is_none() {
-            clnt.sha256_hasher = Some(HashAlgorithm::SHA256);
+        if client.sha256_hasher.is_none() {
+            client.sha256_hasher = Some(HashAlgorithm::SHA256);
         }
 
-        clnt.trailing_header_support = opts.trailing_headers && clnt.override_signer_type == SignatureType::SignatureV4;
+        client.trailing_header_support = opts.trailing_headers && client.override_signer_type == SignatureType::SignatureV4;
 
-        clnt.max_retries = MAX_RETRY;
+        client.max_retries = MAX_RETRY;
         if opts.max_retries > 0 {
-            clnt.max_retries = opts.max_retries;
+            client.max_retries = opts.max_retries;
         }
 
-        Ok(clnt)
+        Ok(client)
     }
 
     fn endpoint_url(&self) -> Url {
@@ -243,11 +287,13 @@ impl TransitionClient {
     }
 
     fn set_s3_transfer_accelerate(&self, accelerate_endpoint: &str) {
-        todo!();
+        let mut endpoint = self.s3_accelerate_endpoint.lock().unwrap();
+        *endpoint = accelerate_endpoint.to_string();
     }
 
     fn set_s3_enable_dual_stack(&self, enabled: bool) {
-        todo!();
+        let mut dual_stack = self.s3_dual_stack_enabled.lock().unwrap();
+        *dual_stack = enabled;
     }
 
     pub fn hash_materials(
@@ -255,7 +301,22 @@ impl TransitionClient {
         is_md5_requested: bool,
         is_sha256_requested: bool,
     ) -> (HashMap<String, HashAlgorithm>, HashMap<String, Vec<u8>>) {
-        todo!()
+        // `hash_algos` declares which algorithms are active for this multipart upload.
+        // `hash_sums` keeps the current part digest bytes and is refreshed on every loop.
+        let mut hash_algos = HashMap::new();
+        let mut hash_sums = HashMap::new();
+
+        if is_md5_requested {
+            hash_algos.insert("md5".to_string(), HashAlgorithm::Md5);
+            hash_sums.insert("md5".to_string(), vec![]);
+        }
+
+        if is_sha256_requested {
+            hash_algos.insert("sha256".to_string(), HashAlgorithm::SHA256);
+            hash_sums.insert("sha256".to_string(), vec![]);
+        }
+
+        (hash_algos, hash_sums)
     }
 
     fn is_online(&self) -> bool {
@@ -272,10 +333,10 @@ impl TransitionClient {
     }
 
     fn health_check(hc_duration: Duration) {
-        todo!();
+        let _ = hc_duration;
     }
 
-    fn dump_http(&self, req: &http::Request<s3s::Body>, resp: &http::Response<Incoming>) -> Result<(), std::io::Error> {
+    fn dump_http(&self, req: &Request<s3s::Body>, resp: &Response<Incoming>) -> Result<(), std::io::Error> {
         let mut resp_trace: Vec<u8>;
 
         //info!("{}{}", self.trace_output, "---------BEGIN-HTTP---------");
@@ -284,7 +345,7 @@ impl TransitionClient {
         Ok(())
     }
 
-    pub async fn doit(&self, req: http::Request<s3s::Body>) -> Result<http::Response<Incoming>, std::io::Error> {
+    pub async fn doit(&self, req: Request<s3s::Body>) -> Result<Response<Incoming>, std::io::Error> {
         let req_method;
         let req_uri;
         let req_headers;
@@ -314,7 +375,7 @@ impl TransitionClient {
         //debug!("http_resp_body: {}", String::from_utf8(b).unwrap());
 
         //if self.is_trace_enabled && !(self.trace_errors_only && resp.status() == StatusCode::OK) {
-        if resp.status() != StatusCode::OK {
+        if !resp.status().is_success() {
             //self.dump_http(&cloned_req, &resp)?;
             let mut body_vec = Vec::new();
             let mut body = resp.into_body();
@@ -336,7 +397,7 @@ impl TransitionClient {
         &self,
         method: http::Method,
         metadata: &mut RequestMetadata,
-    ) -> Result<http::Response<Incoming>, std::io::Error> {
+    ) -> Result<Response<Incoming>, std::io::Error> {
         if self.is_offline() {
             let mut s = self.endpoint_url.to_string();
             s.push_str(" is offline.");
@@ -346,7 +407,7 @@ impl TransitionClient {
         let retryable: bool;
         //let mut body_seeker: BufferReader;
         let mut req_retry = self.max_retries;
-        let mut resp: http::Response<Incoming>;
+        let mut resp: Response<Incoming>;
 
         //if metadata.content_body != nil {
         //body_seeker = BufferReader::new(metadata.content_body.read_all().await?);
@@ -384,10 +445,10 @@ impl TransitionClient {
             err_response.message = format!("remote tier error: {}", err_response.message);
 
             if self.region == "" {
-                match err_response.code {
+                return match err_response.code {
                     S3ErrorCode::AuthorizationHeaderMalformed | S3ErrorCode::InvalidArgument /*S3ErrorCode::InvalidRegion*/ => {
                         //break;
-                        return Err(std::io::Error::other(err_response));
+                        Err(std::io::Error::other(err_response))
                     }
                     S3ErrorCode::AccessDenied => {
                         if err_response.region == "" {
@@ -404,12 +465,12 @@ impl TransitionClient {
                             metadata.bucket_location = err_response.region.clone();
                             //continue;
                         }
-                        return Err(std::io::Error::other(err_response));
+                        Err(std::io::Error::other(err_response))
                     }
                     _ => {
-                        return Err(std::io::Error::other(err_response));
+                        Err(std::io::Error::other(err_response))
                     }
-                }
+                };
             }
 
             if is_s3code_retryable(err_response.code.as_str()) {
@@ -430,7 +491,7 @@ impl TransitionClient {
         &self,
         method: &http::Method,
         metadata: &mut RequestMetadata,
-    ) -> Result<http::Request<s3s::Body>, std::io::Error> {
+    ) -> Result<Request<s3s::Body>, std::io::Error> {
         let mut location = metadata.bucket_location.clone();
         if location == "" && metadata.bucket_name != "" {
             location = self.get_bucket_location(&metadata.bucket_name).await?;
@@ -734,7 +795,19 @@ impl TransitionCore {
     ) -> Result<CompletePart, std::io::Error> {
         //self.0.copy_object_part_do(src_bucket, src_object, dest_bucket, dest_object, upload_id,
         //    part_id, start_offset, length, metadata)
-        todo!();
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            crate::client::credentials::ErrorResponse {
+                sts_error: crate::client::credentials::STSError {
+                    r#type: "".to_string(),
+                    code: "NotImplemented".to_string(),
+                    message: format!(
+                        "copy_object_part is not implemented for {src_bucket}/{src_object} -> {dest_bucket}/{dest_object}"
+                    ),
+                },
+                request_id: "".to_string(),
+            },
+        ))
     }
 
     pub async fn put_object(
@@ -1249,4 +1322,58 @@ pub struct LocationConstraint {
 pub struct CreateBucketConfiguration {
     #[serde(rename = "LocationConstraint")]
     pub location_constraint: String,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{build_tls_config, load_root_store_from_tls_path, with_rustls_init_guard};
+
+    #[test]
+    fn rustls_guard_converts_panics_to_io_errors() {
+        let err = with_rustls_init_guard(|| -> Result<(), std::io::Error> { panic!("missing provider") })
+            .expect_err("panic should be converted into an io::Error");
+        assert!(
+            err.to_string().contains("missing provider"),
+            "expected panic message to be preserved, got: {err}"
+        );
+    }
+
+    #[test]
+    fn build_tls_config_returns_result_without_panicking() {
+        let outcome = std::panic::catch_unwind(build_tls_config);
+        assert!(outcome.is_ok(), "TLS config creation should not panic");
+    }
+
+    /// When RUSTFS_TLS_PATH is not set, `load_root_store_from_tls_path` must return `None`
+    /// (i.e. it must not silently look for a CA bundle in the current working directory).
+    #[test]
+    fn tls_path_unset_returns_none() {
+        let result = temp_env::with_var_unset(rustfs_config::ENV_RUSTFS_TLS_PATH, || load_root_store_from_tls_path());
+        assert!(result.is_none(), "expected None when RUSTFS_TLS_PATH is unset, but got a root store");
+    }
+
+    /// When RUSTFS_TLS_PATH is set to an empty string, `load_root_store_from_tls_path` must
+    /// return `None` to avoid accidentally trusting a CA bundle in the current directory.
+    #[test]
+    fn tls_path_empty_returns_none() {
+        let result = temp_env::with_var(rustfs_config::ENV_RUSTFS_TLS_PATH, Some(""), || load_root_store_from_tls_path());
+        assert!(result.is_none(), "expected None when RUSTFS_TLS_PATH is empty, but got a root store");
+    }
+
+    /// Installing the rustls crypto provider when one is already set must not panic or return
+    /// an error that surfaces to callers (the race-safe `get_default` check guards the install).
+    #[test]
+    fn provider_install_is_idempotent() {
+        // Install once (may already be set by another test in this binary — that's fine).
+        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+
+        // A second install attempt on an already-set provider must not panic.
+        let outcome = std::panic::catch_unwind(|| {
+            if rustls::crypto::CryptoProvider::get_default().is_none() {
+                let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+            }
+            // If a default is already present, the branch above is simply skipped.
+        });
+        assert!(outcome.is_ok(), "provider install guard must not panic when a provider is already set");
+    }
 }

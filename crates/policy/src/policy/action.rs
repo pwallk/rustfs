@@ -201,7 +201,7 @@ impl TryFrom<&str> for Action {
     }
 }
 
-#[derive(Serialize, Deserialize, Hash, PartialEq, Eq, Clone, EnumString, IntoStaticStr, Debug, Copy)]
+#[derive(Serialize, Deserialize, Hash, PartialEq, Eq, Clone, IntoStaticStr, Debug, Copy, EnumString)]
 #[cfg_attr(test, derive(Default))]
 #[serde(try_from = "&str", into = "&str")]
 pub enum S3Action {
@@ -218,6 +218,8 @@ pub enum S3Action {
     ForceDeleteBucketAction,
     #[strum(serialize = "s3:DeleteBucketPolicy")]
     DeleteBucketPolicyAction,
+    #[strum(serialize = "s3:DeleteBucketPublicAccessBlock")]
+    DeleteBucketPublicAccessBlockAction,
     #[strum(serialize = "s3:DeleteBucketCors")]
     DeleteBucketCorsAction,
     #[strum(serialize = "s3:DeleteObject")]
@@ -228,10 +230,18 @@ pub enum S3Action {
     GetBucketNotificationAction,
     #[strum(serialize = "s3:GetBucketPolicy")]
     GetBucketPolicyAction,
+    #[strum(serialize = "s3:GetBucketPublicAccessBlock")]
+    GetBucketPublicAccessBlockAction,
     #[strum(serialize = "s3:GetBucketCors")]
     GetBucketCorsAction,
+    #[strum(serialize = "s3:GetBucketAcl")]
+    GetBucketAclAction,
+    #[strum(serialize = "s3:PutBucketAcl")]
+    PutBucketAclAction,
     #[strum(serialize = "s3:GetObject")]
     GetObjectAction,
+    #[strum(serialize = "s3:GetObjectAcl")]
+    GetObjectAclAction,
     #[strum(serialize = "s3:GetObjectAttributes")]
     GetObjectAttributesAction,
     #[strum(serialize = "s3:HeadBucket")]
@@ -256,14 +266,22 @@ pub enum S3Action {
     PutBucketLifecycleAction,
     #[strum(serialize = "s3:GetBucketLifecycle")]
     GetBucketLifecycleAction,
+    #[strum(serialize = "s3:PutBucketLogging")]
+    PutBucketLoggingAction,
+    #[strum(serialize = "s3:GetBucketLogging")]
+    GetBucketLoggingAction,
     #[strum(serialize = "s3:PutBucketNotification")]
     PutBucketNotificationAction,
     #[strum(serialize = "s3:PutBucketPolicy")]
     PutBucketPolicyAction,
+    #[strum(serialize = "s3:PutBucketPublicAccessBlock")]
+    PutBucketPublicAccessBlockAction,
     #[strum(serialize = "s3:PutBucketCors")]
     PutBucketCorsAction,
     #[strum(serialize = "s3:PutObject")]
     PutObjectAction,
+    #[strum(serialize = "s3:PutObjectAcl")]
+    PutObjectAclAction,
     #[strum(serialize = "s3:DeleteObjectVersion")]
     DeleteObjectVersionAction,
     #[strum(serialize = "s3:DeleteObjectVersionTagging")]
@@ -363,7 +381,7 @@ pub enum S3Action {
 // }
 
 // AdminAction - admin policy action.
-#[derive(Serialize, Deserialize, Hash, PartialEq, Eq, Clone, EnumString, IntoStaticStr, Debug, Copy)]
+#[derive(Serialize, Deserialize, Hash, PartialEq, Eq, Clone, IntoStaticStr, Debug, Copy, EnumString)]
 #[serde(try_from = "&str", into = "&str")]
 pub enum AdminAction {
     #[strum(serialize = "admin:Heal")]
@@ -478,6 +496,8 @@ pub enum AdminAction {
     GetBucketTargetAction,
     #[strum(serialize = "admin:ReplicationDiff")]
     ReplicationDiff,
+    #[strum(serialize = "admin:GetReplicationMetrics")]
+    GetReplicationMetricsAction,
     #[strum(serialize = "admin:ImportBucketMetadata")]
     ImportBucketMetadataAction,
     #[strum(serialize = "admin:ExportBucketMetadata")]
@@ -563,6 +583,7 @@ impl AdminAction {
                 | AdminAction::SetBucketTargetAction
                 | AdminAction::GetBucketTargetAction
                 | AdminAction::ReplicationDiff
+                | AdminAction::GetReplicationMetricsAction
                 | AdminAction::ImportBucketMetadataAction
                 | AdminAction::ExportBucketMetadataAction
                 | AdminAction::SetTierAction
@@ -578,11 +599,18 @@ impl AdminAction {
     }
 }
 
-#[derive(Serialize, Deserialize, Hash, PartialEq, Eq, Clone, EnumString, IntoStaticStr, Debug, Copy)]
+#[derive(Serialize, Deserialize, Hash, PartialEq, Eq, Clone, IntoStaticStr, Debug, Copy)]
 #[serde(try_from = "&str", into = "&str")]
 pub enum StsAction {}
 
-#[derive(Serialize, Deserialize, Hash, PartialEq, Eq, Clone, EnumString, IntoStaticStr, Debug, Copy)]
+impl TryFrom<&str> for StsAction {
+    type Error = strum::ParseError;
+    fn try_from(_value: &str) -> std::result::Result<Self, Self::Error> {
+        Err(strum::ParseError::VariantNotFound)
+    }
+}
+
+#[derive(Serialize, Deserialize, Hash, PartialEq, Eq, Clone, IntoStaticStr, Debug, Copy, EnumString)]
 #[serde(try_from = "&str", into = "&str")]
 pub enum KmsAction {
     #[strum(serialize = "kms:*")]
@@ -644,5 +672,10 @@ mod tests {
         let arr = parsed.as_array().expect("Should be array");
         assert_eq!(arr.len(), 1);
         assert_eq!(arr[0].as_str().unwrap(), "s3:*");
+    }
+
+    #[test]
+    fn test_get_replication_metrics_admin_action_is_valid() {
+        assert!(AdminAction::GetReplicationMetricsAction.is_valid());
     }
 }

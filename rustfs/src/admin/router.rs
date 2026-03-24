@@ -12,9 +12,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::admin::console::is_console_path;
-use crate::admin::console::make_console_server;
-use crate::server::{ADMIN_PREFIX, HEALTH_PREFIX, PROFILE_CPU_PATH, PROFILE_MEMORY_PATH, RPC_PREFIX};
+use crate::admin::console::{is_console_path, make_console_server};
+use crate::admin::handlers::oidc::is_oidc_path;
+use crate::server::{ADMIN_PREFIX, HEALTH_PREFIX, HEALTH_READY_PATH, MINIO_ADMIN_PREFIX, PROFILE_CPU_PATH, PROFILE_MEMORY_PATH};
 use hyper::HeaderMap;
 use hyper::Method;
 use hyper::StatusCode;
@@ -22,7 +22,6 @@ use hyper::Uri;
 use hyper::http::Extensions;
 use matchit::Params;
 use matchit::Router;
-use rustfs_ecstore::rpc::verify_rpc_signature;
 use s3s::Body;
 use s3s::S3Request;
 use s3s::S3Response;
@@ -31,12 +30,27 @@ use s3s::header;
 use s3s::route::S3Route;
 use s3s::s3_error;
 use tower::Service;
-use tracing::error;
 
 pub struct S3Router<T> {
     router: Router<T>,
     console_enabled: bool,
     console_router: Option<axum::routing::RouterIntoService<Body>>,
+}
+
+fn is_public_health_path(path: &str) -> bool {
+    path == HEALTH_PREFIX || path == HEALTH_READY_PATH
+}
+
+fn is_admin_path(path: &str) -> bool {
+    path.starts_with(ADMIN_PREFIX) || path.starts_with(MINIO_ADMIN_PREFIX)
+}
+
+fn canonicalize_admin_path(path: &str) -> std::borrow::Cow<'_, str> {
+    if let Some(suffix) = path.strip_prefix(MINIO_ADMIN_PREFIX) {
+        return std::borrow::Cow::Owned(format!("{ADMIN_PREFIX}{suffix}"));
+    }
+
+    std::borrow::Cow::Borrowed(path)
 }
 
 impl<T: Operation> S3Router<T> {
@@ -71,6 +85,20 @@ impl<T: Operation> S3Router<T> {
     }
 }
 
+#[cfg(test)]
+impl<T: Operation> S3Router<T> {
+    pub(crate) fn contains_route(&self, method: Method, path: &str) -> bool {
+        let route = Self::make_route_str(method, path);
+        self.router.at(&route).is_ok()
+    }
+
+    pub(crate) fn contains_compatible_route(&self, method: Method, path: &str) -> bool {
+        let canonical_path = canonicalize_admin_path(path);
+        let route = Self::make_route_str(method, canonical_path.as_ref());
+        self.router.at(&route).is_ok()
+    }
+}
+
 impl<T: Operation> Default for S3Router<T> {
     fn default() -> Self {
         Self::new(false)
@@ -91,7 +119,7 @@ where
         }
 
         // Health check
-        if (method == Method::HEAD || method == Method::GET) && path == HEALTH_PREFIX {
+        if (method == Method::HEAD || method == Method::GET) && is_public_health_path(path) {
             return true;
         }
 
@@ -108,7 +136,7 @@ where
             return true;
         }
 
-        path.starts_with(ADMIN_PREFIX) || path.starts_with(RPC_PREFIX) || is_console_path(path)
+        is_admin_path(path) || is_console_path(path)
     }
 
     // check_access before call
@@ -122,7 +150,7 @@ where
         }
 
         // Health check
-        if (req.method == Method::HEAD || req.method == Method::GET) && path == HEALTH_PREFIX {
+        if (req.method == Method::HEAD || req.method == Method::GET) && is_public_health_path(path) {
             return Ok(());
         }
 
@@ -131,15 +159,32 @@ where
             return Ok(());
         }
 
-        // Check RPC signature verification
-        if req.uri.path().starts_with(RPC_PREFIX) {
-            // Skip signature verification for HEAD requests (health checks)
-            if req.method != Method::HEAD {
-                verify_rpc_signature(&req.uri.to_string(), &req.method, &req.headers).map_err(|e| {
-                    error!("RPC signature verification failed: {}", e);
-                    s3_error!(AccessDenied, "{}", e)
-                })?;
-            }
+        // Allow unauthenticated access to OIDC endpoints (user not yet authenticated)
+        if is_oidc_path(path) {
+            return Ok(());
+        }
+
+        // Allow unauthenticated STS requests to POST / (AssumeRoleWithWebIdentity
+        // doesn't use SigV4 — the JWT token in the request body is the authentication).
+        // The handler dispatches on the Action parameter: AssumeRole will reject if
+        // credentials are missing, AssumeRoleWithWebIdentity will validate the JWT.
+        // Require application/x-www-form-urlencoded Content-Type to narrow the bypass.
+        if req.method == Method::POST
+            && path == "/"
+            && req.credentials.is_none()
+            && req
+                .headers
+                .get(header::CONTENT_TYPE)
+                .and_then(|v| v.to_str().ok())
+                .map(|ct| {
+                    ct.split(';')
+                        .next()
+                        .unwrap_or("")
+                        .trim()
+                        .eq_ignore_ascii_case("application/x-www-form-urlencoded")
+                })
+                .unwrap_or(false)
+        {
             return Ok(());
         }
 
@@ -166,7 +211,8 @@ where
             return Err(s3_error!(InternalError, "console is not enabled"));
         }
 
-        let uri = format!("{}|{}", &req.method, req.uri.path());
+        let canonical_path = canonicalize_admin_path(req.uri.path());
+        let uri = format!("{}|{}", &req.method, canonical_path.as_ref());
 
         if let Ok(mat) = self.router.at(&uri) {
             let op: &T = mat.value;
@@ -197,11 +243,29 @@ impl Operation for AdminOperation {
     }
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn canonicalize_admin_path_maps_compat_prefix_to_rustfs_prefix() {
+        assert_eq!(canonicalize_admin_path("/minio/admin/v3/info").as_ref(), "/rustfs/admin/v3/info");
+        assert_eq!(canonicalize_admin_path("/rustfs/admin/v3/info").as_ref(), "/rustfs/admin/v3/info");
+    }
+
+    #[test]
+    fn is_admin_path_accepts_rustfs_and_compat_prefixes() {
+        assert!(is_admin_path("/rustfs/admin/v3/info"));
+        assert!(is_admin_path("/minio/admin/v3/info"));
+        assert!(!is_admin_path("/bucket/object"));
+    }
+}
+
 #[allow(dead_code)]
 #[derive(Debug, Clone)]
 pub struct Extra {
     pub credentials: Option<s3s::auth::Credentials>,
-    pub region: Option<String>,
+    pub region: Option<s3s::region::Region>,
     pub service: Option<String>,
 }
 

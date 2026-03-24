@@ -55,9 +55,9 @@ impl Args<'_> {
 pub struct Policy {
     #[serde(default, rename = "ID")]
     pub id: ID,
-    #[serde(rename = "Version")]
+    #[serde(default, rename = "Version")]
     pub version: String,
-    #[serde(rename = "Statement")]
+    #[serde(default, rename = "Statement")]
     pub statements: Vec<Statement>,
 }
 
@@ -70,13 +70,15 @@ impl Policy {
             }
         }
 
-        // Owner has all permissions
-        if args.is_owner {
+        // DenyOnly mode: only validate explicit Deny statements.
+        // If no Deny matched above, allow the request.
+        if args.deny_only {
             return true;
         }
 
-        if args.deny_only {
-            return false;
+        // Owner has all permissions
+        if args.is_owner {
+            return true;
         }
 
         // Check Allow statements
@@ -603,7 +605,7 @@ mod test {
     }
 
     #[tokio::test]
-    async fn test_deny_only_security_fix() -> Result<()> {
+    async fn test_deny_only_checks_only_deny_statements() -> Result<()> {
         let data = r#"
 {
   "Version": "2012-10-17",
@@ -621,7 +623,8 @@ mod test {
         let conditions = HashMap::new();
         let claims = HashMap::new();
 
-        // Test with deny_only=true but no matching Allow statement
+        // deny_only=true should allow if no Deny statement matches,
+        // even when no Allow statement matches.
         let args_deny_only = Args {
             account: "testuser",
             groups: &None,
@@ -631,16 +634,15 @@ mod test {
             is_owner: false,
             object: "test.txt",
             claims: &claims,
-            deny_only: true, // Should NOT automatically allow
+            deny_only: true,
         };
 
-        // Should return false because deny_only=true, regardless of whether there's a matching Allow statement
         assert!(
-            !policy.is_allowed(&args_deny_only).await,
-            "deny_only should return false when deny_only=true, regardless of Allow statements"
+            policy.is_allowed(&args_deny_only).await,
+            "deny_only should allow when no Deny statement matches"
         );
 
-        // Test with deny_only=true and matching Allow statement
+        // deny_only=true should also allow when action matches Allow statement.
         let args_deny_only_allowed = Args {
             account: "testuser",
             groups: &None,
@@ -653,13 +655,12 @@ mod test {
             deny_only: true,
         };
 
-        // Should return false because deny_only=true prevents checking Allow statements (unless is_owner=true)
         assert!(
-            !policy.is_allowed(&args_deny_only_allowed).await,
-            "deny_only should return false even with matching Allow statement"
+            policy.is_allowed(&args_deny_only_allowed).await,
+            "deny_only should allow when no Deny statement matches, even if Allow exists"
         );
 
-        // Test with deny_only=false (normal case)
+        // Normal policy evaluation remains unchanged when deny_only=false.
         let args_normal = Args {
             account: "testuser",
             groups: &None,
@@ -678,21 +679,40 @@ mod test {
             "normal policy evaluation should allow with matching Allow statement"
         );
 
+        // Explicit Deny must still block request in deny_only mode.
+        let deny_policy_data = r#"
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Effect": "Deny",
+      "Action": ["s3:PutObject"],
+      "Resource": ["arn:aws:s3:::bucket2/*"]
+    }
+  ]
+}
+"#;
+        let deny_policy = Policy::parse_config(deny_policy_data.as_bytes())?;
+        assert!(
+            !deny_policy.is_allowed(&args_deny_only).await,
+            "deny_only should reject request when an explicit Deny matches"
+        );
+
         let args_owner_deny_only = Args {
             account: "testuser",
             groups: &None,
             action: Action::S3Action(crate::policy::action::S3Action::PutObjectAction),
             bucket: "bucket2",
             conditions: &conditions,
-            is_owner: true, // Owner has all permissions
+            is_owner: true,
             object: "test.txt",
             claims: &claims,
-            deny_only: true, // Even with deny_only=true, owner should be allowed
+            deny_only: true,
         };
 
         assert!(
             policy.is_allowed(&args_owner_deny_only).await,
-            "owner should retain all permissions even when deny_only=true"
+            "deny_only should allow when no Deny statement matches, including owner requests"
         );
 
         Ok(())
@@ -1015,17 +1035,113 @@ mod test {
         let result = Policy::parse_config(data.as_bytes());
         assert!(result.is_err(), "Statement with both Resource and NotResource should be invalid");
 
-        // Verify the specific error type
-        if let Err(e) = result {
-            let error_msg = format!("{}", e);
-            assert!(
-                error_msg.contains("Resource")
-                    && error_msg.contains("NotResource")
-                    && error_msg.contains("cannot both be specified"),
-                "Error should be BothResourceAndNotResource, got: {}",
-                error_msg
-            );
-        }
+        assert!(
+            matches!(result.as_ref().unwrap_err(), Error::PolicyError(IamError::BothResourceAndNotResource)),
+            "Error should be BothResourceAndNotResource, got: {:?}",
+            result.unwrap_err()
+        );
+    }
+
+    #[test]
+    fn test_statement_with_only_notaction_is_valid() {
+        // IAM allows a statement with only NotAction (no Action). Deserialization should accept
+        // missing "Action" (default to empty) and validate when exactly one of Action/NotAction is set.
+        let data = r#"
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Effect": "Allow",
+      "NotAction": ["s3:DeleteBucket", "s3:DeleteObject"],
+      "Resource": ["arn:aws:s3:::mybucket/*"]
+    }
+  ]
+}
+"#;
+
+        let result = Policy::parse_config(data.as_bytes());
+        assert!(result.is_ok(), "Statement with only NotAction should be valid, got: {:?}", result.err());
+        let policy = result.unwrap();
+        assert_eq!(policy.statements.len(), 1);
+        assert!(policy.statements[0].actions.is_empty());
+        assert!(!policy.statements[0].not_actions.is_empty());
+
+        // Round-trip: serialization must omit empty Action so re-parse does not violate both-Action-and-NotAction
+        let json = serde_json::to_string(&policy).expect("Should serialize");
+        let round_tripped = Policy::parse_config(json.as_bytes());
+        assert!(
+            round_tripped.is_ok(),
+            "NotAction-only statement must round-trip without gaining Action: {}",
+            round_tripped.unwrap_err()
+        );
+        let parsed: serde_json::Value = serde_json::from_str(&json).expect("JSON valid");
+        let stmt = &parsed["Statement"][0];
+        assert!(
+            !stmt
+                .get("Action")
+                .is_some_and(|v| v.as_array().map(|a| a.is_empty()).unwrap_or(false)),
+            "Serialized JSON must not contain empty Action for NotAction-only statement"
+        );
+    }
+
+    #[test]
+    fn test_parse_empty_policy_object_as_implied_policy() {
+        let policy = Policy::parse_config(b"{}").expect("empty JSON object should parse");
+
+        assert!(policy.version.is_empty());
+        assert!(policy.statements.is_empty());
+    }
+
+    #[test]
+    fn test_statement_with_both_action_and_notaction_is_invalid() {
+        // Test: A statement with both Action and NotAction returns BothActionAndNotAction error
+        let data = r#"
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Effect": "Allow",
+      "Action": ["s3:GetObject"],
+      "NotAction": ["s3:DeleteObject"],
+      "Resource": ["arn:aws:s3:::mybucket/*"]
+    }
+  ]
+}
+"#;
+
+        let result = Policy::parse_config(data.as_bytes());
+        assert!(result.is_err(), "Statement with both Action and NotAction should be invalid");
+
+        assert!(
+            matches!(result.as_ref().unwrap_err(), Error::PolicyError(IamError::BothActionAndNotAction)),
+            "Error should be BothActionAndNotAction, got: {:?}",
+            result.unwrap_err()
+        );
+    }
+
+    #[test]
+    fn test_statement_with_neither_action_nor_notaction_is_invalid() {
+        // Statement with both Action and NotAction omitted (both default to empty) fails validation.
+        let data = r#"
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Effect": "Allow",
+      "Resource": ["arn:aws:s3:::mybucket/*"]
+    }
+  ]
+}
+"#;
+
+        let result = Policy::parse_config(data.as_bytes());
+        assert!(result.is_err(), "Statement with neither Action nor NotAction should be invalid");
+
+        assert!(
+            matches!(result.as_ref().unwrap_err(), Error::PolicyError(IamError::NonAction)),
+            "Error should be NonAction, got: {:?}",
+            result.unwrap_err()
+        );
     }
 
     #[test]
@@ -1046,15 +1162,11 @@ mod test {
         let result = Policy::parse_config(data.as_bytes());
         assert!(result.is_err(), "Statement with neither Resource nor NotResource should be invalid");
 
-        // Verify the specific error type
-        if let Err(e) = result {
-            let error_msg = format!("{}", e);
-            assert!(
-                error_msg.contains("Resource") && error_msg.contains("empty"),
-                "Error should be NonResource, got: {}",
-                error_msg
-            );
-        }
+        assert!(
+            matches!(result.as_ref().unwrap_err(), Error::PolicyError(IamError::NonResource)),
+            "Error should be NonResource, got: {:?}",
+            result.unwrap_err()
+        );
     }
 
     #[test]
@@ -1159,5 +1271,92 @@ mod test {
         let arr = action.as_array().expect("Should be array");
         assert_eq!(arr.len(), 1);
         assert_eq!(arr[0].as_str().unwrap(), "s3:ListBucket");
+    }
+
+    #[tokio::test]
+    async fn test_bucket_policy_deny_with_string_not_equals() -> Result<()> {
+        let data = r#"
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Effect": "Deny",
+      "Action": "s3:PutObject",
+      "Principal": {"AWS": "*"},
+      "Resource": "arn:aws:s3:::mybucket/*",
+      "Condition": {
+        "StringNotEquals": {
+          "s3:x-amz-server-side-encryption": "aws:kms"
+        }
+      }
+    },
+    {
+      "Effect": "Deny",
+      "Action": "s3:PutObject",
+      "Principal": {"AWS": "*"},
+      "Resource": "arn:aws:s3:::mybucket/*",
+      "Condition": {
+        "Null": {
+          "s3:x-amz-server-side-encryption": "true"
+        }
+      }
+    }
+  ]
+}
+"#;
+
+        let bp: BucketPolicy = serde_json::from_slice(data.as_bytes())?;
+
+        // Request with wrong encryption → should be DENIED (StringNotEquals matches)
+        let mut cond_wrong_enc = HashMap::new();
+        cond_wrong_enc.insert("x-amz-server-side-encryption".to_string(), vec!["AES256".to_string()]);
+
+        let args_wrong = BucketPolicyArgs {
+            account: "testowner",
+            groups: &None,
+            action: Action::S3Action(crate::policy::action::S3Action::PutObjectAction),
+            bucket: "mybucket",
+            conditions: &cond_wrong_enc,
+            is_owner: true,
+            object: "testobj",
+        };
+        assert!(
+            !bp.is_allowed(&args_wrong).await,
+            "Should deny PutObject with AES256 when policy requires aws:kms"
+        );
+
+        // Request with correct encryption → should be ALLOWED
+        let mut cond_correct_enc = HashMap::new();
+        cond_correct_enc.insert("x-amz-server-side-encryption".to_string(), vec!["aws:kms".to_string()]);
+
+        let args_correct = BucketPolicyArgs {
+            account: "testowner",
+            groups: &None,
+            action: Action::S3Action(crate::policy::action::S3Action::PutObjectAction),
+            bucket: "mybucket",
+            conditions: &cond_correct_enc,
+            is_owner: true,
+            object: "testobj",
+        };
+        assert!(
+            bp.is_allowed(&args_correct).await,
+            "Should allow PutObject with aws:kms matching the policy"
+        );
+
+        // Request with no encryption header → should be DENIED (Null condition matches)
+        let cond_no_enc = HashMap::new();
+
+        let args_no_enc = BucketPolicyArgs {
+            account: "testowner",
+            groups: &None,
+            action: Action::S3Action(crate::policy::action::S3Action::PutObjectAction),
+            bucket: "mybucket",
+            conditions: &cond_no_enc,
+            is_owner: true,
+            object: "testobj",
+        };
+        assert!(!bp.is_allowed(&args_no_enc).await, "Should deny PutObject with no encryption header");
+
+        Ok(())
     }
 }

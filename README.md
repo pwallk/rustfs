@@ -1,4 +1,4 @@
-[![RustFS](https://github.com/user-attachments/assets/1b5afcd6-a2c3-47ff-8bc3-ce882b0ddca7)](https://rustfs.com)
+[![RustFS](https://repository-images.githubusercontent.com/722597620/0fa936a2-8164-4f53-867f-def4beb64b21)](https://rustfs.com)
 
 <p align="center">RustFS is a high-performance, distributed object storage system built in Rust.</p>
 
@@ -42,6 +42,8 @@ Unlike other storage systems, RustFS is released under the permissible Apache 2.
 - **High Performance**: Built with Rust to ensure maximum speed and resource efficiency.
 - **Distributed Architecture**: Scalable and fault-tolerant design suitable for large-scale deployments.
 - **S3 Compatibility**: Seamless integration with existing S3-compatible applications and tools.
+- **OpenStack Swift API**: Native support for Swift protocol with Keystone authentication.
+- **OpenStack Keystone Integration**: Native support for OpenStack Keystone authentication with X-Auth-Token headers.
 - **Data Lake Support**: Optimized for high-throughput big data and AI workloads.
 - **Open Source**: Licensed under Apache 2.0, encouraging unrestricted community contributions and commercial usage.
 - **User-Friendly**: Designed with simplicity in mind for easy deployment and management.
@@ -54,6 +56,8 @@ Unlike other storage systems, RustFS is released under the permissible Apache 2.
 | **Logging**             | ✅ Available | **Lifecycle Management** | 🚧 Under Testing |
 | **Event Notifications** | ✅ Available | **Distributed Mode**     | 🚧 Under Testing |
 | **K8s Helm Charts**     | ✅ Available | **RustFS KMS**           | 🚧 Under Testing |
+| **Keystone Auth**       | ✅ Available | **Multi-Tenancy**        | ✅ Available     |
+| **Swift API**           | ✅ Available | **Swift Metadata Ops**   | 🚧 Partial       |
 
 ## RustFS vs MinIO Performance
 

@@ -2,6 +2,7 @@
 .DS_Store
 .idea
 .vscode
+.cursor
 .direnv/
 /test
 /logs
@@ -15,6 +16,7 @@ vendor
 cli/rustfs-gui/embedded-rustfs/rustfs
 *.log
 deploy/certs/*
+deploy/data/*
 *jsonl
 .env
 .rustfs.sys
@@ -40,3 +42,11 @@ PR_DESCRIPTION.md
 IMPLEMENTATION_PLAN.md
 scripts/s3-tests/selected_tests.txt
 docs
+
+# nix stuff
+result*
+*.gz
+rustfs-webdav.code-workspace
+
+.aiexclude
+*.bak

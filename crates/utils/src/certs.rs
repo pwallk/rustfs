@@ -15,11 +15,11 @@
 use crate::get_env_bool;
 use rustfs_config::{RUSTFS_TLS_CERT, RUSTFS_TLS_KEY};
 use rustls::RootCertStore;
-use rustls::server::danger::ClientCertVerifier;
-use rustls::server::{ClientHello, ResolvesServerCert, ResolvesServerCertUsingSni, WebPkiClientVerifier};
+use rustls::server::{
+    ClientHello, ResolvesServerCert, ResolvesServerCertUsingSni, WebPkiClientVerifier, danger::ClientCertVerifier,
+};
 use rustls::sign::CertifiedKey;
-use rustls_pemfile::{certs, private_key};
-use rustls_pki_types::{CertificateDer, PrivateKeyDer};
+use rustls_pki_types::{CertificateDer, PrivateKeyDer, pem::PemObject};
 use std::collections::HashMap;
 use std::io::Error;
 use std::path::Path;
@@ -42,7 +42,7 @@ pub fn load_certs(filename: &str) -> io::Result<Vec<CertificateDer<'static>>> {
     let mut reader = io::BufReader::new(cert_file);
 
     // Load and return certificate.
-    let certs = certs(&mut reader)
+    let certs = CertificateDer::pem_reader_iter(&mut reader)
         .collect::<Result<Vec<_>, _>>()
         .map_err(|e| certs_error(format!("certificate file {filename} format error:{e:?}")))?;
     if certs.is_empty() {
@@ -65,7 +65,7 @@ pub fn load_cert_bundle_der_bytes(path: &str) -> io::Result<Vec<Vec<u8>>> {
     let pem = fs::read(path)?;
     let mut reader = io::BufReader::new(&pem[..]);
 
-    let certs = certs(&mut reader)
+    let certs = CertificateDer::pem_reader_iter(&mut reader)
         .collect::<Result<Vec<_>, _>>()
         .map_err(|e| certs_error(format!("Failed to parse PEM certs from {path}: {e}")))?;
 
@@ -93,7 +93,11 @@ pub fn build_webpki_client_verifier(tls_path: &str) -> io::Result<Option<Arc<dyn
         ))
     })?;
 
-    let der_list = load_cert_bundle_der_bytes(ca_path.to_str().unwrap_or_default())?;
+    let ca_path = ca_path
+        .to_str()
+        .ok_or_else(|| Error::other(format!("Invalid UTF-8 in mTLS CA path: {ca_path:?}")))?;
+
+    let der_list = load_cert_bundle_der_bytes(ca_path)?;
 
     let mut store = RootCertStore::empty();
     for der in der_list {
@@ -139,7 +143,8 @@ pub fn load_private_key(filename: &str) -> io::Result<PrivateKeyDer<'static>> {
     let mut reader = io::BufReader::new(keyfile);
 
     // Load and return a single private key.
-    private_key(&mut reader)?.ok_or_else(|| certs_error(format!("no private key found in {filename}")))
+    PrivateKeyDer::from_pem_reader(&mut reader)
+        .map_err(|e| certs_error(format!("failed to parse private key in {filename}: {e}")))
 }
 
 /// error function
@@ -218,7 +223,23 @@ pub fn load_all_certs_from_directory(
 
             if cert_path.exists() && key_path.exists() {
                 debug!("find the domain name certificate: {} in {:?}", domain_name, cert_path);
-                match load_cert_key_pair(cert_path.to_str().unwrap(), key_path.to_str().unwrap()) {
+                let cert_path = match cert_path.to_str() {
+                    Some(path) => path,
+                    None => {
+                        warn!("skip domain certificate load, invalid UTF-8 path: {:?}", cert_path);
+                        continue;
+                    }
+                };
+
+                let key_path = match key_path.to_str() {
+                    Some(path) => path,
+                    None => {
+                        warn!("skip domain key load, invalid UTF-8 path: {:?}", key_path);
+                        continue;
+                    }
+                };
+
+                match load_cert_key_pair(cert_path, key_path) {
                     Ok((certs, key)) => {
                         cert_key_pairs.insert(domain_name.to_string(), (certs, key));
                     }
@@ -319,13 +340,14 @@ pub fn create_multi_cert_resolver(
 /// * A boolean indicating whether TLS key logging is enabled based on the `RUSTFS_TLS_KEYLOG` environment variable.
 ///
 pub fn tls_key_log() -> bool {
-    crate::get_env_bool(rustfs_config::ENV_TLS_KEYLOG, rustfs_config::DEFAULT_TLS_KEYLOG)
+    get_env_bool(rustfs_config::ENV_TLS_KEYLOG, rustfs_config::DEFAULT_TLS_KEYLOG)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::fs;
+    use std::io::ErrorKind;
     use tempfile::TempDir;
 
     #[test]
@@ -333,7 +355,7 @@ mod tests {
         let error_msg = "Test error message";
         let error = certs_error(error_msg.to_string());
 
-        assert_eq!(error.kind(), std::io::ErrorKind::Other);
+        assert_eq!(error.kind(), ErrorKind::Other);
         assert_eq!(error.to_string(), error_msg);
     }
 
@@ -343,7 +365,7 @@ mod tests {
         assert!(result.is_err());
 
         let error = result.unwrap_err();
-        assert_eq!(error.kind(), std::io::ErrorKind::Other);
+        assert_eq!(error.kind(), ErrorKind::Other);
         assert!(error.to_string().contains("failed to open"));
     }
 
@@ -353,7 +375,7 @@ mod tests {
         assert!(result.is_err());
 
         let error = result.unwrap_err();
-        assert_eq!(error.kind(), std::io::ErrorKind::Other);
+        assert_eq!(error.kind(), ErrorKind::Other);
         assert!(error.to_string().contains("failed to open"));
     }
 
@@ -393,7 +415,7 @@ mod tests {
         assert!(result.is_err());
 
         let error = result.unwrap_err();
-        assert!(error.to_string().contains("no private key found"));
+        assert!(error.to_string().contains("failed to parse private key in"));
     }
 
     #[test]
@@ -406,7 +428,7 @@ mod tests {
         assert!(result.is_err());
 
         let error = result.unwrap_err();
-        assert!(error.to_string().contains("no private key found"));
+        assert!(error.to_string().contains("failed to parse private key in"));
     }
 
     #[test]
@@ -585,11 +607,8 @@ mod tests {
 
     #[test]
     fn test_memory_efficiency() {
-        // Test that error types are reasonably sized
-        use std::mem;
-
         let error = certs_error("test".to_string());
-        let error_size = mem::size_of_val(&error);
+        let error_size = std::mem::size_of_val(&error);
 
         // Error should not be excessively large
         assert!(error_size < 1024, "Error size should be reasonable, got {error_size} bytes");

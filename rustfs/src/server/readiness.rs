@@ -96,14 +96,17 @@ where
                 crate::server::PROFILE_MEMORY_PATH
                     | crate::server::PROFILE_CPU_PATH
                     | crate::server::HEALTH_PREFIX
+                    | crate::server::HEALTH_READY_PATH
                     | crate::server::FAVICON_PATH
             );
 
             // 2) Prefix matching: the entire set of route prefixes (including their subpaths)
             let is_prefix_probe = path.starts_with(crate::server::RUSTFS_ADMIN_PREFIX)
+                || path.starts_with(crate::server::MINIO_ADMIN_V3_PREFIX)
                 || path.starts_with(crate::server::CONSOLE_PREFIX)
                 || path.starts_with(crate::server::RPC_PREFIX)
                 || path.starts_with(crate::server::ADMIN_PREFIX)
+                || path.starts_with(crate::server::MINIO_ADMIN_PREFIX)
                 || path.starts_with(crate::server::TONIC_PREFIX);
 
             let is_probe = is_exact_probe || is_prefix_probe;

@@ -12,7 +12,6 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::StorageAPI;
 use crate::bucket::metadata_sys::get_versioning_config;
 use crate::bucket::utils::check_list_objs_args;
 use crate::bucket::versioning::VersioningApi;
@@ -24,7 +23,8 @@ use crate::error::{
 };
 use crate::set_disk::SetDisks;
 use crate::store_api::{
-    ListObjectVersionsInfo, ListObjectsInfo, ObjectInfo, ObjectInfoOrErr, ObjectOptions, WalkOptions, WalkVersionsSortOrder,
+    ListObjectVersionsInfo, ListObjectsInfo, ObjectInfo, ObjectInfoOrErr, ObjectOperations, ObjectOptions, WalkOptions,
+    WalkVersionsSortOrder,
 };
 use crate::store_utils::is_reserved_or_invalid_bucket;
 use crate::{store::ECStore, store_api::ListObjectsV2Info};
@@ -35,7 +35,7 @@ use rustfs_filemeta::{
     merge_file_meta_versions,
 };
 use rustfs_utils::path::{self, SLASH_SEPARATOR, base_dir_from_prefix};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use tokio::sync::broadcast::{self};
 use tokio::sync::mpsc::{self, Receiver, Sender};
@@ -344,22 +344,15 @@ impl ECStore {
         };
 
         let mut prefixes: Vec<String> = Vec::new();
+        let mut prefix_set: HashSet<String> = HashSet::new();
 
         let mut objects = Vec::with_capacity(get_objects.len());
         for obj in get_objects.into_iter() {
-            if let Some(delimiter) = &delimiter {
+            if delimiter.is_some() {
                 if obj.is_dir && obj.mod_time.is_none() {
-                    let mut found = false;
-                    if delimiter != SLASH_SEPARATOR {
-                        for p in prefixes.iter() {
-                            if found {
-                                break;
-                            }
-                            found = p == &obj.name;
-                        }
-                    }
-                    if !found {
-                        prefixes.push(obj.name.clone());
+                    // Check if prefix already exists to avoid duplicates
+                    if prefix_set.insert(obj.name.clone()) {
+                        prefixes.push(obj.name);
                     }
                 } else {
                     objects.push(obj);
@@ -471,22 +464,15 @@ impl ECStore {
         };
 
         let mut prefixes: Vec<String> = Vec::new();
+        let mut prefix_set: HashSet<String> = HashSet::new();
 
         let mut objects = Vec::with_capacity(get_objects.len());
         for obj in get_objects.into_iter() {
-            if let Some(delimiter) = &delimiter {
+            if delimiter.is_some() {
                 if obj.is_dir && obj.mod_time.is_none() {
-                    let mut found = false;
-                    if delimiter != SLASH_SEPARATOR {
-                        for p in prefixes.iter() {
-                            if found {
-                                break;
-                            }
-                            found = p == &obj.name;
-                        }
-                    }
-                    if !found {
-                        prefixes.push(obj.name.clone());
+                    // Check if prefix already exists to avoid duplicates
+                    if prefix_set.insert(obj.name.clone()) {
+                        prefixes.push(obj.name);
                     }
                 } else {
                     objects.push(obj);
@@ -506,7 +492,7 @@ impl ECStore {
     }
 
     pub async fn list_path(self: Arc<Self>, o: &ListPathOptions) -> Result<MetaCacheEntriesSortedResult> {
-        // warn!("list_path opt {:?}", &o);
+        // tracing::warn!("list_path opt {:?}", &o);
 
         check_list_objs_args(&o.bucket, &o.prefix, &o.marker)?;
         // if opts.prefix.ends_with(SLASH_SEPARATOR) {

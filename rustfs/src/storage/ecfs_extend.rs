@@ -12,9 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::config::workload_profiles::{
-    RustFSBufferConfig, WorkloadProfile, get_global_buffer_config, is_buffer_profile_enabled,
-};
+use crate::config::{RustFSBufferConfig, WorkloadProfile, get_global_buffer_config, is_buffer_profile_enabled};
 use crate::error::ApiError;
 use crate::server::cors;
 use crate::storage::ecfs::ListObjectUnorderedQuery;
@@ -25,13 +23,13 @@ use rustfs_ecstore::bucket::metadata_sys::get_replication_config;
 use rustfs_ecstore::bucket::object_lock::objectlock_sys;
 use rustfs_ecstore::bucket::replication::ReplicationConfigurationExt;
 use rustfs_ecstore::error::StorageError;
-use rustfs_ecstore::store_api::{BucketOptions, ObjectInfo, ObjectToDelete};
-use rustfs_ecstore::{StorageAPI, new_object_layer_fn};
+use rustfs_ecstore::new_object_layer_fn;
+use rustfs_ecstore::store_api::{BucketOperations, BucketOptions, ObjectInfo, ObjectToDelete};
 use rustfs_targets::EventName;
 use rustfs_targets::arn::{TargetID, TargetIDError};
 use rustfs_utils::http::{
     AMZ_OBJECT_LOCK_LEGAL_HOLD_LOWER, AMZ_OBJECT_LOCK_MODE_LOWER, AMZ_OBJECT_LOCK_RETAIN_UNTIL_DATE_LOWER,
-    RESERVED_METADATA_PREFIX_LOWER,
+    SUFFIX_OBJECTLOCK_LEGALHOLD_TIMESTAMP, SUFFIX_OBJECTLOCK_RETENTION_TIMESTAMP, insert_str,
 };
 use s3s::dto::{
     Delimiter, LambdaFunctionConfiguration, NotificationConfigurationFilter, ObjectLockConfiguration, ObjectLockEnabled,
@@ -63,6 +61,7 @@ pub const RFC1123: &[FormatItem<'_>] =
 /// # Arguments
 /// * `object_lock_config` - Optional bucket Object Lock configuration. If None, no retention is applied.
 /// * `metadata` - Mutable reference to object metadata HashMap. Retention headers are inserted here.
+#[allow(dead_code)]
 pub(crate) fn apply_lock_retention(object_lock_config: Option<ObjectLockConfiguration>, metadata: &mut HashMap<String, String>) {
     if metadata.contains_key(AMZ_OBJECT_LOCK_MODE_LOWER) || metadata.contains_key(AMZ_OBJECT_LOCK_RETAIN_UNTIL_DATE_LOWER) {
         return;
@@ -117,6 +116,22 @@ pub(crate) fn apply_lock_retention(object_lock_config: Option<ObjectLockConfigur
 /// let buffer_size = get_adaptive_buffer_size_with_profile(
 ///     10 * 1024 * 1024,
 ///     Some(WorkloadProfile::SecureStorage)
+/// );
+///
+/// // Use custom profile for specialized requirements
+/// let custom_profile = WorkloadProfile::custom(
+///     32 * 1024,      // min_size: 32KB
+///     2 * 1024 * 1024, // max_size: 2MB
+///     256 * 1024,     // default_unknown: 256KB
+///     vec![
+///         (1024 * 1024, 64 * 1024),           // < 1MB: 64KB
+///         (10 * 1024 * 1024, 128 * 1024),     // 1MB-10MB: 128KB
+///         (i64::MAX, 512 * 1024),             // >= 10MB: 512KB
+///     ],
+/// );
+/// let buffer_size = get_adaptive_buffer_size_with_profile(
+///     5 * 1024 * 1024,
+///     Some(custom_profile)
 /// );
 /// ```
 ///
@@ -283,8 +298,9 @@ pub(crate) fn parse_object_lock_retention(retention: Option<ObjectLockRetention>
         // This is intentional behavior. Empty string represents "retention cleared" which is different from "retention never set". Consistent with minio
         eval_metadata.insert(AMZ_OBJECT_LOCK_MODE_LOWER.to_string(), mode);
         eval_metadata.insert(AMZ_OBJECT_LOCK_RETAIN_UNTIL_DATE_LOWER.to_string(), retain_until_date);
-        eval_metadata.insert(
-            format!("{}{}", RESERVED_METADATA_PREFIX_LOWER, "objectlock-retention-timestamp"),
+        insert_str(
+            &mut eval_metadata,
+            SUFFIX_OBJECTLOCK_RETENTION_TIMESTAMP,
             format!("{}.{:09}Z", now.format(&Rfc3339).unwrap(), now.nanosecond()),
         );
     }
@@ -309,8 +325,9 @@ pub(crate) fn parse_object_lock_legal_hold(legal_hold: Option<ObjectLockLegalHol
         let now = OffsetDateTime::now_utc();
         // This is intentional behavior. Empty string represents "status cleared" which is different from "status never set".
         eval_metadata.insert(AMZ_OBJECT_LOCK_LEGAL_HOLD_LOWER.to_string(), status);
-        eval_metadata.insert(
-            format!("{}{}", RESERVED_METADATA_PREFIX_LOWER, "objectlock-legalhold-timestamp"),
+        insert_str(
+            &mut eval_metadata,
+            SUFFIX_OBJECTLOCK_LEGALHOLD_TIMESTAMP,
             format!("{}.{:09}Z", now.format(&Rfc3339).unwrap(), now.nanosecond()),
         );
     }
@@ -640,12 +657,22 @@ pub(crate) fn needs_cors_processing(headers: &HeaderMap) -> bool {
 /// 2. Retrieves the bucket's CORS configuration
 /// 3. Matches the origin against CORS rules
 /// 4. Validates AllowedHeaders if request headers are present
-/// 5. Returns headers to add to the response if a match is found
+/// 5. Returns one of:
+///    - `None`: bucket has no CORS config (or request has no valid `Origin`)
+///    - `Some(empty headers)`: bucket CORS exists but request is denied / no rule matched
+///    - `Some(non-empty headers)`: bucket CORS exists and request matched
 ///
 /// Note: This function should only be called if `needs_cors_processing()` returns true
 /// to avoid unnecessary overhead for non-CORS requests.
 pub(crate) async fn apply_cors_headers(bucket: &str, method: &http::Method, headers: &HeaderMap) -> Option<HeaderMap> {
     use http::HeaderValue;
+
+    fn is_credentialed_request(headers: &HeaderMap) -> bool {
+        headers.contains_key(http::header::AUTHORIZATION)
+            || headers.contains_key(http::header::COOKIE)
+            || headers.contains_key("x-amz-security-token")
+            || headers.contains_key("x-amz-content-sha256")
+    }
 
     // Get Origin header from request
     let origin = headers.get(cors::standard::ORIGIN)?.to_str().ok()?;
@@ -658,26 +685,23 @@ pub(crate) async fn apply_cors_headers(bucket: &str, method: &http::Method, head
 
     // Early return if no CORS rules configured
     if cors_config.cors_rules.is_empty() {
-        return None;
+        return Some(HeaderMap::new());
     }
 
     // Check if method is supported and get its string representation
     const SUPPORTED_METHODS: &[&str] = &["GET", "PUT", "POST", "DELETE", "HEAD", "OPTIONS"];
     let method_str = method.as_str();
     if !SUPPORTED_METHODS.contains(&method_str) {
-        return None;
+        return Some(HeaderMap::new());
     }
 
-    // For OPTIONS (preflight) requests, check Access-Control-Request-Method
+    // Use Access-Control-Request-Method if present (for preflight and non-preflight requests),
+    // otherwise fall back to the actual HTTP method.
     let is_preflight = method == http::Method::OPTIONS;
-    let requested_method = if is_preflight {
-        headers
-            .get(cors::request::ACCESS_CONTROL_REQUEST_METHOD)
-            .and_then(|v| v.to_str().ok())
-            .unwrap_or(method_str)
-    } else {
-        method_str
-    };
+    let requested_method = headers
+        .get(cors::request::ACCESS_CONTROL_REQUEST_METHOD)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or(method_str);
 
     // Get requested headers from preflight request
     let requested_headers = if is_preflight {
@@ -742,17 +766,35 @@ pub(crate) async fn apply_cors_headers(bucket: &str, method: &http::Method, head
         let mut response_headers = HeaderMap::new();
 
         // Access-Control-Allow-Origin
-        // If origin is "*", use "*", otherwise echo back the origin
+        // Credentials mode + wildcard allow list requires echoing the request origin.
+        // Browsers reject `Access-Control-Allow-Origin: *` with `credentials: include`.
         let has_wildcard_origin = rule.allowed_origins.iter().any(|o| o == "*");
+        let credentialed_request = is_credentialed_request(headers);
+        let mut origin_reflected = false;
+
         if has_wildcard_origin {
-            response_headers.insert(cors::response::ACCESS_CONTROL_ALLOW_ORIGIN, HeaderValue::from_static("*"));
+            if credentialed_request {
+                if let Ok(origin_value) = HeaderValue::from_str(origin) {
+                    response_headers.insert(cors::response::ACCESS_CONTROL_ALLOW_ORIGIN, origin_value);
+                    origin_reflected = true;
+                }
+            } else {
+                response_headers.insert(cors::response::ACCESS_CONTROL_ALLOW_ORIGIN, HeaderValue::from_static("*"));
+            }
         } else if let Ok(origin_value) = HeaderValue::from_str(origin) {
             response_headers.insert(cors::response::ACCESS_CONTROL_ALLOW_ORIGIN, origin_value);
+            origin_reflected = true;
         }
 
-        // Vary: Origin (required for caching, except when using wildcard)
-        if !has_wildcard_origin {
+        // Vary: Origin whenever origin is reflected (non-"*" allow-origin).
+        // This prevents proxy/browser caches from reusing CORS headers across different origins.
+        if origin_reflected {
             response_headers.insert(cors::standard::VARY, HeaderValue::from_static("Origin"));
+        }
+
+        // Credentials mode requires explicit allow-credentials.
+        if credentialed_request {
+            response_headers.insert(cors::response::ACCESS_CONTROL_ALLOW_CREDENTIALS, HeaderValue::from_static("true"));
         }
 
         // Access-Control-Allow-Methods (required for preflight)
@@ -790,7 +832,7 @@ pub(crate) async fn apply_cors_headers(bucket: &str, method: &http::Method, head
         return Some(response_headers);
     }
 
-    None // No matching rule found
+    Some(HeaderMap::new()) // No matching rule found
 }
 /// Check if an origin matches a pattern (supports wildcards like https://*.example.com)
 pub(crate) fn matches_origin_pattern(pattern: &str, origin: &str) -> bool {

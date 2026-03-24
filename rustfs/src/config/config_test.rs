@@ -15,8 +15,7 @@
 #[cfg(test)]
 #[allow(unsafe_op_in_unsafe_fn)]
 mod tests {
-    use crate::config::Opt;
-    use clap::Parser;
+    use crate::config::{Config, Opt};
     use rustfs_ecstore::disks_layout::DisksLayout;
     use serial_test::serial;
     use std::env;
@@ -57,6 +56,20 @@ mod tests {
     }
 
     #[test]
+    #[serial]
+    fn test_server_subcommand_and_legacy_equivalence() {
+        // rustfs server <volume> and rustfs <volume> (legacy) must produce identical results
+        let legacy_args = vec!["rustfs", "/data/vol1"];
+        let server_args = vec!["rustfs", "server", "/data/vol1"];
+        let opt_legacy = Opt::parse_from(legacy_args);
+        let opt_server = Opt::parse_from(server_args);
+        assert_eq!(opt_legacy.volumes, opt_server.volumes);
+        assert_eq!(opt_legacy.address, opt_server.address);
+        assert_eq!(opt_legacy.console_address, opt_server.console_address);
+    }
+
+    #[test]
+    #[serial]
     fn test_default_console_configuration() {
         // Test that default console configuration is correct
         let args = vec!["rustfs", "/test/volume"];
@@ -68,6 +81,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn test_custom_console_configuration() {
         // Test custom console configuration
         let args = vec![
@@ -88,6 +102,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn test_console_and_endpoint_ports_different() {
         // Ensure console and endpoint use different default ports
         let args = vec!["rustfs", "/test/volume"];
@@ -107,6 +122,65 @@ mod tests {
     }
 
     #[test]
+    #[serial]
+    fn test_external_prefixed_envs_are_accepted_by_parser() {
+        temp_env::with_vars(
+            [
+                ("MINIO_VOLUMES", Some("/compat/vol1")),
+                ("MINIO_ADDRESS", Some(":9100")),
+                ("RUSTFS_VOLUMES", None),
+                ("RUSTFS_ADDRESS", None),
+            ],
+            || {
+                let opt = Opt::parse_from(["rustfs"]);
+                assert_eq!(opt.volumes, vec!["/compat/vol1"]);
+                assert_eq!(opt.address, ":9100");
+                assert_eq!(std::env::var("RUSTFS_VOLUMES").as_deref(), Ok("/compat/vol1"));
+                assert_eq!(std::env::var("RUSTFS_ADDRESS").as_deref(), Ok(":9100"));
+            },
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn test_root_envs_are_used_for_bootstrap_credentials() {
+        temp_env::with_vars(
+            [
+                ("RUSTFS_VOLUMES", Some("/compat/vol1")),
+                ("RUSTFS_ROOT_USER", Some("root-user")),
+                ("RUSTFS_ROOT_PASSWORD", Some("root-password")),
+                ("RUSTFS_ACCESS_KEY", None),
+                ("RUSTFS_SECRET_KEY", None),
+            ],
+            || {
+                let config = Config::from_opt(Opt::parse_from(["rustfs"])).expect("config should parse");
+                assert_eq!(config.access_key, "root-user");
+                assert_eq!(config.secret_key, "root-password");
+            },
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn test_access_key_env_takes_precedence_over_root_aliases() {
+        temp_env::with_vars(
+            [
+                ("RUSTFS_VOLUMES", Some("/compat/vol1")),
+                ("RUSTFS_ACCESS_KEY", Some("canonical-access")),
+                ("RUSTFS_SECRET_KEY", Some("canonical-secret")),
+                ("RUSTFS_ROOT_USER", Some("root-user")),
+                ("RUSTFS_ROOT_PASSWORD", Some("root-password")),
+            ],
+            || {
+                let config = Config::from_opt(Opt::parse_from(["rustfs"])).expect("config should parse");
+                assert_eq!(config.access_key, "canonical-access");
+                assert_eq!(config.secret_key, "canonical-secret");
+            },
+        );
+    }
+
+    #[test]
+    #[serial]
     fn test_volumes_and_disk_layout_parsing() {
         use rustfs_ecstore::disks_layout::DisksLayout;
 
@@ -436,6 +510,7 @@ mod tests {
 
     /// Test error handling for invalid ellipses patterns.
     #[test]
+    #[serial]
     fn test_invalid_ellipses_patterns() {
         // Test case 1: Invalid ellipses format (letters instead of numbers)
         let args = vec!["rustfs", "/data/vol{a...z}"];
@@ -458,6 +533,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn test_server_domains_parsing() {
         // Test case 1: server domains without ports
         let args = vec![
@@ -522,5 +598,85 @@ mod tests {
         assert_eq!(opt.server_domains[0], "localhost:9000");
         assert_eq!(opt.server_domains[1], "127.0.0.1:9000");
         assert_eq!(opt.server_domains[2], "localhost");
+    }
+
+    #[test]
+    #[serial]
+    fn test_access_key_arguments_mutually_exclusive_cli() {
+        // Test that CLI args configuration fails on conflict
+        let args = vec![
+            "rustfs",
+            "/test/volume",
+            "--access-key",
+            "foobar",
+            "--access-key-file",
+            "/foo/bar",
+        ];
+        let opt_res = Opt::try_parse_from(args);
+
+        // can't specify both access-key and access-key-file at once
+        assert!(opt_res.is_err());
+        let err = opt_res.err().unwrap();
+        assert_eq!(err.kind(), clap::error::ErrorKind::ArgumentConflict);
+    }
+
+    #[test]
+    #[serial]
+    #[allow(unsafe_code)]
+    fn test_access_key_arguments_mutually_exclusive_env_var() {
+        // Test that env var args configuration fails on conflict
+        with_env_var("RUSTFS_VOLUMES", "/data/my disk/vol1", || {
+            with_env_var("RUSTFS_ACCESS_KEY", "foo", || {
+                with_env_var("RUSTFS_ACCESS_KEY_FILE", "/foo/bar", || {
+                    let args = vec!["rustfs"];
+                    let opt_res = Opt::try_parse_from(args);
+
+                    // can't specify both RUSTFS_ACCESS_KEY and RUSTFS_ACCESS_KEY_FILE at once
+                    assert!(opt_res.is_err());
+                    let err = opt_res.err().unwrap();
+                    assert_eq!(err.kind(), clap::error::ErrorKind::ArgumentConflict);
+                });
+            });
+        });
+    }
+
+    #[test]
+    #[serial]
+    fn test_secret_key_arguments_mutually_exclusive_cli() {
+        // Test that CLI args configuration fails on conflict
+        let args = vec![
+            "rustfs",
+            "/test/volume",
+            "--secret-key",
+            "foobar",
+            "--secret-key-file",
+            "/foo/bar",
+        ];
+        let opt_res = Opt::try_parse_from(args);
+
+        // can't specify both secret-key and secret-key-file at once
+        assert!(opt_res.is_err());
+        let err = opt_res.err().unwrap();
+        assert_eq!(err.kind(), clap::error::ErrorKind::ArgumentConflict);
+    }
+
+    #[test]
+    #[serial]
+    #[allow(unsafe_code)]
+    fn test_secret_key_arguments_mutually_exclusive_env_var() {
+        // Test that env var args configuration fails on conflict
+        with_env_var("RUSTFS_VOLUMES", "/data/my disk/vol1", || {
+            with_env_var("RUSTFS_SECRET_KEY", "foo", || {
+                with_env_var("RUSTFS_SECRET_KEY_FILE", "/foo/bar", || {
+                    let args = vec!["rustfs"];
+                    let opt_res = Opt::try_parse_from(args);
+
+                    // can't specify both RUSTFS_SECRET_KEY and RUSTFS_SECRET_KEY_FILE at once
+                    assert!(opt_res.is_err());
+                    let err = opt_res.err().unwrap();
+                    assert_eq!(err.kind(), clap::error::ErrorKind::ArgumentConflict);
+                });
+            });
+        });
     }
 }

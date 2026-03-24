@@ -27,14 +27,25 @@ pub(crate) const FAVICON_PATH: &str = "/favicon.ico";
 /// This path is used to check the health status of the server.
 pub(crate) const HEALTH_PREFIX: &str = "/health";
 
+/// Predefined readiness check path for RustFS server.
+/// This path is used to check dependency readiness and may return 503.
+pub(crate) const HEALTH_READY_PATH: &str = "/health/ready";
+
 /// Predefined administrative prefix for RustFS server routes.
 /// This prefix is used for endpoints that handle administrative tasks
 /// such as configuration, monitoring, and management.
 pub(crate) const ADMIN_PREFIX: &str = "/rustfs/admin";
 
+/// MinIO-compatible administrative prefix accepted by RustFS.
+/// This alias allows stock MinIO admin tooling to reach RustFS handlers.
+pub(crate) const MINIO_ADMIN_PREFIX: &str = "/minio/admin";
+
 /// Environment variable name for overriding the default
 /// administrative prefix path.
 pub(crate) const RUSTFS_ADMIN_PREFIX: &str = "/rustfs/admin/v3";
+
+/// MinIO-compatible admin API prefix accepted by RustFS.
+pub(crate) const MINIO_ADMIN_V3_PREFIX: &str = "/minio/admin/v3";
 
 /// Predefined console prefix for RustFS server routes.
 /// This prefix is used for endpoints that handle console-related tasks

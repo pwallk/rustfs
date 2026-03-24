@@ -23,6 +23,7 @@ pub mod local;
 pub mod os;
 
 pub const RUSTFS_META_BUCKET: &str = ".rustfs.sys";
+pub const MIGRATING_META_BUCKET: &str = ".minio.sys";
 pub const RUSTFS_META_MULTIPART_BUCKET: &str = ".rustfs.sys/multipart";
 pub const RUSTFS_META_TMP_BUCKET: &str = ".rustfs.sys/tmp";
 pub const RUSTFS_META_TMP_DELETED_BUCKET: &str = ".rustfs.sys/tmp/.trash";
@@ -60,7 +61,6 @@ pub enum Disk {
 
 #[async_trait::async_trait]
 impl DiskAPI for Disk {
-    #[tracing::instrument(skip(self))]
     fn to_string(&self) -> String {
         match self {
             Disk::Local(local_disk) => local_disk.to_string(),
@@ -68,7 +68,6 @@ impl DiskAPI for Disk {
         }
     }
 
-    #[tracing::instrument(skip(self))]
     async fn is_online(&self) -> bool {
         match self {
             Disk::Local(local_disk) => local_disk.is_online().await,
@@ -76,7 +75,6 @@ impl DiskAPI for Disk {
         }
     }
 
-    #[tracing::instrument(skip(self))]
     fn is_local(&self) -> bool {
         match self {
             Disk::Local(local_disk) => local_disk.is_local(),
@@ -84,7 +82,6 @@ impl DiskAPI for Disk {
         }
     }
 
-    #[tracing::instrument(skip(self))]
     fn host_name(&self) -> String {
         match self {
             Disk::Local(local_disk) => local_disk.host_name(),
@@ -92,7 +89,6 @@ impl DiskAPI for Disk {
         }
     }
 
-    #[tracing::instrument(skip(self))]
     fn endpoint(&self) -> Endpoint {
         match self {
             Disk::Local(local_disk) => local_disk.endpoint(),
@@ -100,7 +96,6 @@ impl DiskAPI for Disk {
         }
     }
 
-    #[tracing::instrument(skip(self))]
     async fn close(&self) -> Result<()> {
         match self {
             Disk::Local(local_disk) => local_disk.close().await,
@@ -108,7 +103,6 @@ impl DiskAPI for Disk {
         }
     }
 
-    #[tracing::instrument(skip(self))]
     async fn get_disk_id(&self) -> Result<Option<Uuid>> {
         match self {
             Disk::Local(local_disk) => local_disk.get_disk_id().await,
@@ -116,7 +110,6 @@ impl DiskAPI for Disk {
         }
     }
 
-    #[tracing::instrument(skip(self))]
     async fn set_disk_id(&self, id: Option<Uuid>) -> Result<()> {
         match self {
             Disk::Local(local_disk) => local_disk.set_disk_id(id).await,
@@ -124,7 +117,6 @@ impl DiskAPI for Disk {
         }
     }
 
-    #[tracing::instrument(skip(self))]
     fn path(&self) -> PathBuf {
         match self {
             Disk::Local(local_disk) => local_disk.path(),
@@ -132,7 +124,6 @@ impl DiskAPI for Disk {
         }
     }
 
-    #[tracing::instrument(skip(self))]
     fn get_disk_location(&self) -> DiskLocation {
         match self {
             Disk::Local(local_disk) => local_disk.get_disk_location(),
@@ -164,7 +155,6 @@ impl DiskAPI for Disk {
         }
     }
 
-    #[tracing::instrument(skip(self))]
     async fn stat_volume(&self, volume: &str) -> Result<VolumeInfo> {
         match self {
             Disk::Local(local_disk) => local_disk.stat_volume(volume).await,
@@ -408,6 +398,18 @@ impl DiskAPI for Disk {
         match self {
             Disk::Local(local_disk) => local_disk.read_metadata(volume, path).await,
             Disk::Remote(remote_disk) => remote_disk.read_metadata(volume, path).await,
+        }
+    }
+}
+
+impl Disk {
+    /// Enable health monitoring on this disk.
+    /// Called after startup format loading completes so that remote peers
+    /// have time to come online before being marked as faulty.
+    pub fn enable_health_check(&self) {
+        match self {
+            Disk::Local(local_disk) => local_disk.enable_health_check(),
+            Disk::Remote(remote_disk) => remote_disk.enable_health_check(),
         }
     }
 }

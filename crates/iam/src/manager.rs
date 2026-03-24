@@ -25,6 +25,7 @@ use crate::{
 };
 use futures::future::join_all;
 use rustfs_credentials::{Credentials, EMBEDDED_POLICY_TYPE, INHERITED_POLICY_TYPE, get_global_action_cred};
+use rustfs_ecstore::global::is_first_cluster_node_local;
 use rustfs_madmin::{AccountStatus, AddOrUpdateUserReq, GroupDesc};
 use rustfs_policy::{
     arn::ARN,
@@ -32,7 +33,7 @@ use rustfs_policy::{
     format::Format,
     policy::{Policy, PolicyDoc, default::DEFAULT_POLICIES, iam_policy_claim_name_sa},
 };
-use rustfs_utils::path::path_join_buf;
+use rustfs_utils::{get_env_opt_str, path::path_join_buf};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::sync::atomic::AtomicU8;
@@ -133,8 +134,7 @@ where
             if let Err(e) = self.clone().load().await {
                 if attempt == MAX_RETRIES - 1 {
                     self.state.store(IamState::Error as u8, Ordering::SeqCst);
-                    error!("IAM fail to load initial data after {} attempts: {:?}", MAX_RETRIES, e);
-                    return Err(e);
+                    warn!("IAM failed to load initial data after {} attempts: {:?}", MAX_RETRIES, e);
                 } else {
                     warn!("IAM load failed, retrying... attempt {}", attempt + 1);
                     tokio::time::sleep(Duration::from_secs(1)).await;
@@ -148,7 +148,7 @@ where
 
         // Background ticker for synchronization
         // Check if environment variable is set
-        let skip_background_task = std::env::var("RUSTFS_SKIP_BACKGROUND_TASK").is_ok();
+        let skip_background_task = get_env_opt_str("RUSTFS_SKIP_BACKGROUND_TASK").is_some();
 
         if !skip_background_task {
             // Background thread starts periodic updates or receives signal updates
@@ -162,7 +162,7 @@ where
                             _ = ticker.tick() => {
                                 info!("iam load ticker");
                                 if let Err(err) =s.clone().load().await{
-                                    error!("iam load err {:?}", err);
+                                    warn!("iam load err {:?}", err);
                                 }
                             },
                             i = receiver.recv() => {
@@ -173,7 +173,7 @@ where
                                         if last <= t {
                                             info!("iam load receiver load");
                                             if let Err(err) =s.clone().load().await{
-                                                error!("iam load err {:?}", err);
+                                                warn!("iam load err {:?}", err);
                                             }
                                             ticker.reset();
                                         }
@@ -301,6 +301,10 @@ where
         };
 
         if iam_fmt.version >= IAM_FORMAT_VERSION_1 {
+            return Ok(());
+        }
+
+        if !is_first_cluster_node_local().await {
             return Ok(());
         }
 
@@ -596,7 +600,11 @@ where
         Ok(users
             .values()
             .filter_map(|x| {
-                if !access_key.is_empty() && x.credentials.parent_user.as_str() == access_key && x.credentials.is_temp() {
+                if !access_key.is_empty()
+                    && x.credentials.parent_user.as_str() == access_key
+                    && x.credentials.is_temp()
+                    && !x.credentials.is_service_account()
+                {
                     let mut c = x.credentials.clone();
                     c.secret_key = String::new();
                     c.session_token = String::new();
@@ -1387,11 +1395,9 @@ where
 
         let user_group_memberships = self.cache.user_group_memberships.load();
         members.iter().for_each(|member| {
-            if let Some(m) = user_group_memberships.get(member) {
-                let mut m = m.clone();
-                m.insert(group.to_string());
-                Cache::add_or_update(&self.cache.user_group_memberships, member, &m, OffsetDateTime::now_utc());
-            }
+            let mut m = user_group_memberships.get(member).cloned().unwrap_or_default();
+            m.insert(group.to_string());
+            Cache::add_or_update(&self.cache.user_group_memberships, member, &m, OffsetDateTime::now_utc());
         });
 
         Ok(OffsetDateTime::now_utc())
@@ -1422,9 +1428,6 @@ where
     }
 
     pub async fn get_group_description(&self, name: &str) -> Result<GroupDesc> {
-        let (ps, updated_at) = self.policy_db_get_internal(name, true, false).await?;
-        let policy = ps.join(",");
-
         let gi = self
             .cache
             .groups
@@ -1433,13 +1436,25 @@ where
             .cloned()
             .ok_or(Error::NoSuchGroup(name.to_string()))?;
 
-        Ok(GroupDesc {
-            name: name.to_string(),
-            policy,
-            members: gi.members,
-            updated_at: Some(updated_at),
-            status: gi.status,
-        })
+        let mapped_policy = if let Some(policy) = self.cache.group_policies.load().get(name).cloned() {
+            Some(policy)
+        } else {
+            let mut policies = HashMap::new();
+            if let Err(err) = self.api.load_mapped_policy(name, UserType::Reg, true, &mut policies).await
+                && !is_err_no_such_policy(&err)
+            {
+                return Err(err);
+            }
+
+            if let Some(policy) = policies.get(name).cloned() {
+                Cache::add_or_update(&self.cache.group_policies, name, &policy, OffsetDateTime::now_utc());
+                Some(policy)
+            } else {
+                None
+            }
+        };
+
+        Ok(build_group_desc(name, gi, mapped_policy))
     }
 
     pub async fn list_groups(&self) -> Result<Vec<String>> {
@@ -1519,13 +1534,19 @@ where
             }
         }
 
-        let gi = self
-            .cache
-            .groups
-            .load()
-            .get(group)
-            .cloned()
-            .ok_or(Error::NoSuchGroup(group.to_string()))?;
+        let gi = if members.is_empty() {
+            // Reload from backend so we see latest members (e.g. after user was deleted elsewhere)
+            let mut m = HashMap::new();
+            self.api.load_group(group, &mut m).await?;
+            m.get(group).cloned().ok_or(Error::NoSuchGroup(group.to_string()))?
+        } else {
+            self.cache
+                .groups
+                .load()
+                .get(group)
+                .cloned()
+                .ok_or(Error::NoSuchGroup(group.to_string()))?
+        };
 
         if members.is_empty() && !gi.members.is_empty() {
             return Err(Error::GroupNotEmpty);
@@ -1725,6 +1746,15 @@ where
         }
 
         let u = m[name].clone();
+        match user_type {
+            UserType::Sts => {
+                Cache::add_or_update(&self.cache.sts_accounts, name, &u, OffsetDateTime::now_utc());
+            }
+            UserType::Reg | UserType::Svc => {
+                Cache::add_or_update(&self.cache.users, name, &u, OffsetDateTime::now_utc());
+            }
+            UserType::None => {}
+        }
 
         match user_type {
             UserType::Sts => {
@@ -1749,7 +1779,7 @@ where
                     return Ok(());
                 }
 
-                Cache::add_or_update(&self.cache.sts_policies, name, &m[name], OffsetDateTime::now_utc());
+                Cache::add_or_update(&self.cache.user_policies, name, &m[name], OffsetDateTime::now_utc());
             }
 
             UserType::Svc => {
@@ -1868,6 +1898,20 @@ fn filter_policies(cache: &Cache, policy_name: &str, bucket_name: &str) -> (Stri
     }
 
     (policies.join(","), Policy::merge_policies(to_merge))
+}
+
+fn build_group_desc(name: &str, group_info: GroupInfo, mapped_policy: Option<MappedPolicy>) -> GroupDesc {
+    let (policy, updated_at) = mapped_policy
+        .map(|policy| (policy.policies, Some(policy.update_at)))
+        .unwrap_or_else(|| (String::new(), Some(OffsetDateTime::now_utc())));
+
+    GroupDesc {
+        name: name.to_string(),
+        policy,
+        members: group_info.members,
+        updated_at,
+        status: group_info.status,
+    }
 }
 
 #[cfg(test)]
@@ -2213,5 +2257,23 @@ mod tests {
         assert_eq!(merged.version, "2012-10-17");
         assert!(merged.statements.is_empty());
         assert!(merged.is_empty());
+    }
+
+    #[test]
+    fn test_build_group_desc_preserves_policy_for_disabled_group() {
+        let group_info = GroupInfo {
+            status: STATUS_DISABLED.to_string(),
+            members: vec!["alice".to_string()],
+            ..Default::default()
+        };
+        let mapped_policy = MappedPolicy::new("readonly");
+
+        let desc = build_group_desc("ops", group_info, Some(mapped_policy));
+
+        assert_eq!(desc.name, "ops");
+        assert_eq!(desc.status, STATUS_DISABLED);
+        assert_eq!(desc.policy, "readonly");
+        assert_eq!(desc.members, vec!["alice".to_string()]);
+        assert!(desc.updated_at.is_some());
     }
 }

@@ -14,6 +14,7 @@
 
 use crate::admin::auth::validate_admin_request;
 use crate::admin::router::{AdminOperation, Operation, S3Router};
+use crate::admin::utils::read_compatible_admin_body;
 use crate::auth::{check_key_valid, get_session_token};
 use crate::error::ApiError;
 use crate::server::{ADMIN_PREFIX, RemoteAddr};
@@ -21,18 +22,23 @@ use http::{HeaderMap, HeaderValue, Uri};
 use hyper::{Method, StatusCode};
 use matchit::Params;
 use rustfs_config::MAX_ADMIN_REQUEST_BODY_SIZE;
+use rustfs_credentials::Credentials;
 use rustfs_ecstore::bucket::bucket_target_sys::BucketTargetSys;
 use rustfs_ecstore::bucket::metadata::BUCKET_TARGETS_FILE;
 use rustfs_ecstore::bucket::metadata_sys;
+use rustfs_ecstore::bucket::metadata_sys::get_replication_config;
+use rustfs_ecstore::bucket::replication::BucketStats;
+use rustfs_ecstore::bucket::replication::GLOBAL_REPLICATION_STATS;
 use rustfs_ecstore::bucket::target::BucketTarget;
+use rustfs_ecstore::error::StorageError;
 use rustfs_ecstore::global::global_rustfs_port;
 use rustfs_ecstore::new_object_layer_fn;
-use rustfs_ecstore::store_api::{BucketOptions, StorageAPI};
+use rustfs_ecstore::store_api::{BucketOperations, BucketOptions};
 use rustfs_policy::policy::action::{Action, AdminAction};
 use s3s::header::CONTENT_TYPE;
 use s3s::{Body, S3Error, S3ErrorCode, S3Request, S3Response, S3Result, s3_error};
 use std::collections::HashMap;
-use tracing::{debug, error, warn};
+use tracing::{debug, error, info, warn};
 use url::Host;
 
 fn extract_query_params(uri: &Uri) -> HashMap<String, String> {
@@ -75,7 +81,7 @@ pub fn register_replication_route(r: &mut S3Router<AdminOperation>) -> std::io::
     Ok(())
 }
 
-async fn validate_replication_admin_request(req: &S3Request<Body>, action: AdminAction) -> S3Result<()> {
+async fn validate_replication_admin_request(req: &S3Request<Body>, action: AdminAction) -> S3Result<Credentials> {
     let Some(input_cred) = req.credentials.as_ref() else {
         return Err(s3_error!(InvalidRequest, "get cred failed"));
     };
@@ -84,7 +90,9 @@ async fn validate_replication_admin_request(req: &S3Request<Body>, action: Admin
         check_key_valid(get_session_token(&req.uri, &req.headers).unwrap_or_default(), &input_cred.access_key).await?;
 
     let remote_addr = req.extensions.get::<Option<RemoteAddr>>().and_then(|opt| opt.map(|a| a.0));
-    validate_admin_request(&req.headers, &cred, owner, false, vec![Action::AdminAction(action)], remote_addr).await
+    validate_admin_request(&req.headers, &cred, owner, false, vec![Action::AdminAction(action)], remote_addr).await?;
+
+    Ok(cred)
 }
 
 #[allow(dead_code)]
@@ -98,12 +106,52 @@ pub struct GetReplicationMetricsHandler {}
 #[async_trait::async_trait]
 impl Operation for GetReplicationMetricsHandler {
     async fn call(&self, req: S3Request<Body>, _params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
-        error!("GetReplicationMetricsHandler");
+        validate_replication_admin_request(&req, AdminAction::GetReplicationMetricsAction).await?;
+
         let queries = extract_query_params(&req.uri);
-        if let Some(bucket) = queries.get("bucket") {
-            error!("get bucket:{} metrics", bucket);
+
+        let Some(bucket) = queries.get("bucket") else {
+            return Err(s3_error!(InvalidRequest, "bucket is required"));
+        };
+
+        if bucket.is_empty() {
+            return Err(s3_error!(InvalidRequest, "bucket is required"));
         }
-        Ok(S3Response::new((StatusCode::OK, Body::from("Ok".to_string()))))
+
+        let Some(store) = new_object_layer_fn() else {
+            return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));
+        };
+
+        store
+            .get_bucket_info(bucket, &BucketOptions::default())
+            .await
+            .map_err(ApiError::from)?;
+
+        if let Err(err) = get_replication_config(bucket).await {
+            if err == StorageError::ConfigNotFound {
+                info!("replication configuration not found for bucket '{}'", bucket);
+                return Err(S3Error::with_message(
+                    S3ErrorCode::ReplicationConfigurationNotFoundError,
+                    "replication not found".to_string(),
+                ));
+            }
+            error!("get_replication_config unexpected error: {:?}", err);
+            return Err(ApiError::from(err).into());
+        }
+
+        // TODO cluster cache
+        // In actual implementation, statistics would be obtained from cluster
+        // This is simplified to get from local cache
+        let bucket_stats = match GLOBAL_REPLICATION_STATS.get() {
+            Some(s) => s.get_latest_replication_stats(bucket).await,
+            None => BucketStats::default(),
+        };
+
+        let data = serde_json::to_vec(&bucket_stats.replication_stats)
+            .map_err(|_| S3Error::with_message(S3ErrorCode::InternalError, "serialize failed"))?;
+        let mut headers = HeaderMap::new();
+        headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
+        Ok(S3Response::with_headers((StatusCode::OK, Body::from(data)), headers))
     }
 }
 
@@ -112,7 +160,7 @@ pub struct SetRemoteTargetHandler {}
 #[async_trait::async_trait]
 impl Operation for SetRemoteTargetHandler {
     async fn call(&self, req: S3Request<Body>, _params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
-        validate_replication_admin_request(&req, AdminAction::SetBucketTargetAction).await?;
+        let cred = validate_replication_admin_request(&req, AdminAction::SetBucketTargetAction).await?;
 
         let queries = extract_query_params(&req.uri);
 
@@ -137,14 +185,14 @@ impl Operation for SetRemoteTargetHandler {
             .await
             .map_err(ApiError::from)?;
 
-        let mut input = req.input;
-        let body = match input.store_all_limited(MAX_ADMIN_REQUEST_BODY_SIZE).await {
-            Ok(b) => b,
-            Err(e) => {
-                warn!("get body failed, e: {:?}", e);
-                return Err(s3_error!(InvalidRequest, "remote target configuration body too large or failed to read"));
-            }
-        };
+        let body =
+            match read_compatible_admin_body(req.input, MAX_ADMIN_REQUEST_BODY_SIZE, req.uri.path(), &cred.secret_key).await {
+                Ok(body) => body,
+                Err(e) => {
+                    warn!("get body failed, e: {:?}", e);
+                    return Err(e);
+                }
+            };
 
         let mut remote_target: BucketTarget = serde_json::from_slice(&body).map_err(|e| {
             error!("Failed to parse BucketTarget from body: {}", e);
@@ -177,6 +225,8 @@ impl Operation for SetRemoteTargetHandler {
                 let arn_str = serde_json::to_string(&arn).unwrap_or_default();
 
                 warn!("return exists, arn: {}", arn_str);
+                // MinIO-compatible clients encrypt the request payload for this endpoint,
+                // but they parse the success response directly as plain JSON string ARN.
                 return Ok(S3Response::new((StatusCode::OK, Body::from(arn_str))));
             }
         }
@@ -232,6 +282,8 @@ impl Operation for SetRemoteTargetHandler {
 
         let arn_str = serde_json::to_string(&arn).unwrap_or_default();
 
+        // MinIO-compatible clients encrypt the request payload for this endpoint,
+        // but they parse the success response directly as plain JSON string ARN.
         Ok(S3Response::new((StatusCode::OK, Body::from(arn_str))))
     }
 }

@@ -12,8 +12,6 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-#![allow(dead_code)]
-
 //! Adaptive buffer sizing optimization for different workload types.
 //!
 //! This module provides intelligent buffer size selection based on file size and workload profile
@@ -24,7 +22,7 @@ use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 /// Global buffer configuration that can be set at application startup
-static GLOBAL_BUFFER_CONFIG: OnceLock<RustFSBufferConfig> = OnceLock::new();
+static BUFFER_CONFIG_SINGLETON: OnceLock<RustFSBufferConfig> = OnceLock::new();
 
 /// Global flag indicating whether buffer profiles are enabled
 static BUFFER_PROFILE_ENABLED: AtomicBool = AtomicBool::new(false);
@@ -60,20 +58,21 @@ pub fn is_buffer_profile_enabled() -> bool {
 /// init_global_buffer_config(RustFSBufferConfig::new(WorkloadProfile::AiTraining));
 /// ```
 pub fn init_global_buffer_config(config: RustFSBufferConfig) {
-    let _ = GLOBAL_BUFFER_CONFIG.set(config);
+    let _ = BUFFER_CONFIG_SINGLETON.set(config);
 }
 
 /// Get the global buffer configuration
 ///
 /// Returns the configured profile, or GeneralPurpose if not initialized.
 pub fn get_global_buffer_config() -> &'static RustFSBufferConfig {
-    GLOBAL_BUFFER_CONFIG.get_or_init(RustFSBufferConfig::default)
+    BUFFER_CONFIG_SINGLETON.get_or_init(RustFSBufferConfig::default)
 }
 
 /// Workload profile types that define buffer sizing strategies
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Default)]
 pub enum WorkloadProfile {
     /// General purpose - default configuration with balanced performance and memory
+    #[default]
     GeneralPurpose,
     /// AI/ML training: optimized for large sequential reads with maximum throughput
     AiTraining,
@@ -142,6 +141,25 @@ impl WorkloadProfile {
                 WorkloadProfile::GeneralPurpose
             }
         }
+    }
+
+    /// Create a custom workload profile with specified buffer configuration
+    ///
+    /// # Arguments
+    /// * `min_size` - Minimum buffer size in bytes
+    /// * `max_size` - Maximum buffer size in bytes
+    /// * `default_unknown` - Default size for unknown file size scenarios
+    /// * `thresholds` - File size thresholds and corresponding buffer sizes
+    ///
+    /// # Returns
+    /// A WorkloadProfile::Custom with the specified configuration
+    pub fn custom(min_size: usize, max_size: usize, default_unknown: usize, thresholds: Vec<(i64, usize)>) -> Self {
+        WorkloadProfile::Custom(BufferConfig {
+            min_size,
+            max_size,
+            default_unknown,
+            thresholds,
+        })
     }
 
     /// Get the buffer configuration for this workload profile
@@ -359,6 +377,29 @@ impl RustFSBufferConfig {
     /// Get the buffer size for a given file size
     pub fn get_buffer_size(&self, file_size: i64) -> usize {
         self.base_config.calculate_buffer_size(file_size)
+    }
+
+    /// Get the current workload profile
+    pub fn workload_profile(&self) -> &WorkloadProfile {
+        &self.workload
+    }
+
+    /// Get the name of the current workload profile
+    pub fn workload_name(&self) -> String {
+        match &self.workload {
+            WorkloadProfile::GeneralPurpose => "GeneralPurpose".to_string(),
+            WorkloadProfile::AiTraining => "AiTraining".to_string(),
+            WorkloadProfile::DataAnalytics => "DataAnalytics".to_string(),
+            WorkloadProfile::WebWorkload => "WebWorkload".to_string(),
+            WorkloadProfile::IndustrialIoT => "IndustrialIoT".to_string(),
+            WorkloadProfile::SecureStorage => "SecureStorage".to_string(),
+            WorkloadProfile::Custom(_) => "Custom".to_string(),
+        }
+    }
+
+    /// Validate the buffer configuration
+    pub fn validate(&self) -> Result<(), String> {
+        self.base_config.validate()
     }
 }
 
@@ -613,6 +654,41 @@ mod tests {
         assert_eq!(WorkloadProfile::from_name("unknown"), WorkloadProfile::GeneralPurpose);
         assert_eq!(WorkloadProfile::from_name("invalid"), WorkloadProfile::GeneralPurpose);
         assert_eq!(WorkloadProfile::from_name(""), WorkloadProfile::GeneralPurpose);
+    }
+
+    #[test]
+    fn test_custom_workload_profile() {
+        // Create a custom profile with specific buffer sizes
+        let custom_profile = WorkloadProfile::custom(
+            32 * KI_B,  // min_size: 32KB
+            2 * MI_B,   // max_size: 2MB
+            256 * KI_B, // default_unknown: 256KB
+            vec![
+                (MI_B as i64, 64 * KI_B),       // < 1MB: 64KB
+                (10 * MI_B as i64, 128 * KI_B), // 1MB-10MB: 128KB
+                (i64::MAX, 512 * KI_B),         // >= 10MB: 512KB
+            ],
+        );
+
+        // Verify it's a Custom variant
+        match &custom_profile {
+            WorkloadProfile::Custom(config) => {
+                assert_eq!(config.min_size, 32 * KI_B);
+                assert_eq!(config.max_size, 2 * MI_B);
+                assert_eq!(config.default_unknown, 256 * KI_B);
+                assert_eq!(config.thresholds.len(), 3);
+            }
+            _ => panic!("Expected Custom variant"),
+        }
+
+        // Test buffer size calculation with custom profile
+        let buffer_config = RustFSBufferConfig::new(custom_profile);
+        assert_eq!(buffer_config.get_buffer_size(500 * KI_B as i64), 64 * KI_B);
+        assert_eq!(buffer_config.get_buffer_size(5 * MI_B as i64), 128 * KI_B);
+        assert_eq!(buffer_config.get_buffer_size(100 * MI_B as i64), 512 * KI_B);
+
+        // Test validation
+        assert!(buffer_config.validate().is_ok());
     }
 
     #[test]

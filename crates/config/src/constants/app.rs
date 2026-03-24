@@ -98,11 +98,96 @@ pub const RUSTFS_HTTP_PREFIX: &str = "http://";
 /// Default value: https://
 pub const RUSTFS_HTTPS_PREFIX: &str = "https://";
 
+/// Default documentation URL for rustfs
+/// This is the default documentation URL for rustfs.
+/// It is used to provide the documentation of the application.
+/// Default value: https://docs.rustfs.com
+pub const RUSTFS_DOCS_URL: &str = "https://docs.rustfs.com";
+
+/// Default GitHub URL for rustfs
+/// This is the default GitHub URL for rustfs.
+/// It is used to provide the source code of the application.
+/// Default value: https://github.com/rustfs/rustfs
+pub const RUSTFS_GITHUB_URL: &str = "https://github.com/rustfs/rustfs";
+
+/// Default license for rustfs
+/// This is the default license for rustfs.
+/// It is used to provide the license of the application.
+/// Default value: Apache-2.0
+pub const RUSTFS_LICENSE: &str = "Apache-2.0";
+
+/// Default license URL for rustfs
+/// This is the default license URL for rustfs.
+/// It is used to provide the license URL of the application.
+/// Default value: https://www.apache.org/licenses/LICENSE-2.0
+pub const RUSTFS_LICENSE_URL: &str = "https://www.apache.org/licenses/LICENSE-2.0";
+
 /// Environment variable for rustfs address
 /// This is the environment variable for rustfs address.
 /// It is used to bind the server to a specific address.
 /// Example: RUSTFS_ADDRESS=":9000"
 pub const ENV_RUSTFS_ADDRESS: &str = "RUSTFS_ADDRESS";
+
+/// Environment variable for server volumes.
+pub const ENV_RUSTFS_VOLUMES: &str = "RUSTFS_VOLUMES";
+
+/// Environment variable for server access key.
+pub const ENV_RUSTFS_ACCESS_KEY: &str = "RUSTFS_ACCESS_KEY";
+
+/// Environment variable for server access key file.
+pub const ENV_RUSTFS_ACCESS_KEY_FILE: &str = "RUSTFS_ACCESS_KEY_FILE";
+
+/// Environment variable for server root user.
+pub const ENV_RUSTFS_ROOT_USER: &str = "RUSTFS_ROOT_USER";
+
+/// Environment variable for server secret key.
+pub const ENV_RUSTFS_SECRET_KEY: &str = "RUSTFS_SECRET_KEY";
+
+/// Environment variable for server secret key file.
+pub const ENV_RUSTFS_SECRET_KEY_FILE: &str = "RUSTFS_SECRET_KEY_FILE";
+
+/// Environment variable for server root password.
+pub const ENV_RUSTFS_ROOT_PASSWORD: &str = "RUSTFS_ROOT_PASSWORD";
+
+/// Environment variable for server OBS endpoint.
+pub const ENV_RUSTFS_OBS_ENDPOINT: &str = "RUSTFS_OBS_ENDPOINT";
+
+/// Environment variable for console server enable.
+pub const ENV_RUSTFS_CONSOLE_ENABLE: &str = "RUSTFS_CONSOLE_ENABLE";
+
+/// Environment variable for console server address.
+pub const ENV_RUSTFS_CONSOLE_ADDRESS: &str = "RUSTFS_CONSOLE_ADDRESS";
+
+/// Environment variable for server tls path.
+pub const ENV_RUSTFS_TLS_PATH: &str = "RUSTFS_TLS_PATH";
+
+/// Environment variable for server KMS enable.
+pub const ENV_RUSTFS_KMS_ENABLE: &str = "RUSTFS_KMS_ENABLE";
+
+/// Default KMS enable for server-side encryption
+/// This is the default value for enabling KMS encryption for server-side encryption.
+/// Default value: false
+pub const DEFAULT_KMS_ENABLE: bool = false;
+
+/// Environment variable for server KMS backend.
+pub const ENV_RUSTFS_KMS_BACKEND: &str = "RUSTFS_KMS_BACKEND";
+
+/// Default KMS backend for server-side encryption
+/// This is the default KMS backend for server-side encryption.
+/// Default value: local
+pub const DEFAULT_KMS_BACKEND: &str = "local";
+
+/// Environment variable for selecting the buffer profile used for adaptive buffer sizing.
+pub const ENV_RUSTFS_BUFFER_PROFILE: &str = "RUSTFS_BUFFER_PROFILE";
+
+/// Default buffer profile for adaptive buffer sizing
+/// This is the default buffer profile for adaptive buffer sizing.
+/// It is used to identify the workload profile for adaptive buffer sizing.
+/// Default value: GeneralPurpose
+pub const DEFAULT_BUFFER_PROFILE: &str = "GeneralPurpose";
+
+/// Default value for the server TLS path if `ENV_RUSTFS_TLS_PATH` is not set.
+pub const DEFAULT_RUSTFS_TLS_PATH: &str = "";
 
 /// Default port for rustfs
 /// This is the default port for rustfs.
@@ -119,20 +204,34 @@ pub const DEFAULT_CONSOLE_PORT: u16 = 9001;
 
 /// Default address for rustfs console
 /// This is the default address for rustfs console.
+/// This is used to bind the console server to a specific address.
+/// Default value: :9001
 pub const DEFAULT_CONSOLE_ADDRESS: &str = concat!(":", DEFAULT_CONSOLE_PORT);
+
+/// Default region for rustfs
+/// This is the default region for rustfs.
+/// It is used to identify the region of the application.
+/// Default value: us-east-1
+pub const RUSTFS_REGION: &str = "us-east-1";
+
+/// Environment variable for server region.
+pub const ENV_RUSTFS_REGION: &str = "RUSTFS_REGION";
+
+/// Environment variable for server license.
+pub const ENV_RUSTFS_LICENSE: &str = "RUSTFS_LICENSE";
 
 /// Default log filename for rustfs
 /// This is the default log filename for rustfs.
 /// It is used to store the logs of the application.
 /// Default value: rustfs.log
-/// Environment variable: RUSTFS_OBSERVABILITY_LOG_FILENAME
+/// Environment variable: RUSTFS_OBS_LOG_FILENAME
 pub const DEFAULT_LOG_FILENAME: &str = "rustfs";
 
 /// Default OBS log filename for rustfs
 /// This is the default log filename for OBS.
 /// It is used to store the logs of the application.
 /// Default value: rustfs.log
-pub const DEFAULT_OBS_LOG_FILENAME: &str = concat!(DEFAULT_LOG_FILENAME, "");
+pub const DEFAULT_OBS_LOG_FILENAME: &str = concat!(DEFAULT_LOG_FILENAME, ".log");
 
 /// Default log directory for rustfs
 /// This is the default log directory for rustfs.
@@ -151,9 +250,9 @@ pub const DEFAULT_LOG_ROTATION_SIZE_MB: u64 = 100;
 /// Default log rotation time for rustfs
 /// This is the default log rotation time for rustfs.
 /// It is used to rotate the logs of the application.
-/// Default value: hour, eg: day,hour,minute,second
+/// Default value: hour, eg: daily,hourly,minutely
 /// Environment variable: RUSTFS_OBS_LOG_ROTATION_TIME
-pub const DEFAULT_LOG_ROTATION_TIME: &str = "hour";
+pub const DEFAULT_LOG_ROTATION_TIME: &str = "hourly";
 
 /// Default log keep files for rustfs
 /// This is the default log keep files for rustfs.
@@ -162,11 +261,35 @@ pub const DEFAULT_LOG_ROTATION_TIME: &str = "hour";
 /// Environment variable: RUSTFS_OBS_LOG_KEEP_FILES
 pub const DEFAULT_LOG_KEEP_FILES: usize = 30;
 
+/// Default trace export enabled
+/// It is used to enable or disable exporting traces
+/// Default value: true
+/// Environment variable: RUSTFS_OBS_TRACES_EXPORT_ENABLED
+pub const DEFAULT_OBS_TRACES_EXPORT_ENABLED: bool = true;
+
+/// Default metrics export enabled
+/// It is used to enable or disable exporting metrics
+/// Default value: true
+/// Environment variable: RUSTFS_OBS_METRICS_EXPORT_ENABLED
+pub const DEFAULT_OBS_METRICS_EXPORT_ENABLED: bool = true;
+
+/// Default logs export enabled
+/// It is used to enable or disable exporting logs
+/// Default value: true
+/// Environment variable: RUSTFS_OBS_LOGS_EXPORT_ENABLED
+pub const DEFAULT_OBS_LOGS_EXPORT_ENABLED: bool = true;
+
+/// Default profiling export enabled
+/// It is used to enable or disable exporting profiles
+/// Default value: true
+/// Environment variable: RUSTFS_OBS_PROFILING_EXPORT_ENABLED
+pub const DEFAULT_OBS_PROFILING_EXPORT_ENABLED: bool = true;
+
 /// Default log local logging enabled for rustfs
 /// This is the default log local logging enabled for rustfs.
 /// It is used to enable or disable local logging of the application.
 /// Default value: false
-/// Environment variable: RUSTFS_OBS_LOGL_STDOUT_ENABLED
+/// Environment variable: RUSTFS_OBS_LOG_STDOUT_ENABLED
 pub const DEFAULT_OBS_LOG_STDOUT_ENABLED: bool = false;
 
 /// Constant representing 1 Kibibyte (1024 bytes)

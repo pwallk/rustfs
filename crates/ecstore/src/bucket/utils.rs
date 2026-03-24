@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::disk::RUSTFS_META_BUCKET;
+use crate::disk::{MIGRATING_META_BUCKET, RUSTFS_META_BUCKET};
 use crate::error::{Error, Result, StorageError};
 use regex::Regex;
 use rustfs_utils::path::SLASH_SEPARATOR;
@@ -20,7 +20,7 @@ use s3s::xml;
 use tracing::instrument;
 
 pub fn is_meta_bucketname(name: &str) -> bool {
-    name.starts_with(RUSTFS_META_BUCKET)
+    name.starts_with(RUSTFS_META_BUCKET) || name.starts_with(MIGRATING_META_BUCKET)
 }
 
 lazy_static::lazy_static! {
@@ -190,10 +190,6 @@ pub fn is_valid_object_prefix(object: &str) -> bool {
 pub fn is_valid_object_name(object: &str) -> bool {
     // Implement object name validation
     if object.is_empty() {
-        return false;
-    }
-
-    if object.ends_with(SLASH_SEPARATOR) {
         return false;
     }
 
@@ -379,10 +375,10 @@ mod tests {
         // Invalid cases - empty string
         assert!(!is_valid_object_name(""));
 
-        // Invalid cases - ends with slash (object names cannot end with slash)
-        assert!(!is_valid_object_name("object/"));
-        assert!(!is_valid_object_name("path/to/file/"));
-        assert!(!is_valid_object_name("ends/with/slash/"));
+        // Valid cases - trailing slash is allowed (empty object with trailing slash)
+        assert!(is_valid_object_name("object/"));
+        assert!(is_valid_object_name("path/to/file/"));
+        assert!(is_valid_object_name("ends/with/slash/"));
 
         // Invalid cases - bad path components (inherited from is_valid_object_prefix)
         assert!(!is_valid_object_name("."));
